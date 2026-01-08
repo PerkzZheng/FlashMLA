@@ -16,6 +16,7 @@
 #include "sm90/decode/dense/splitkv_mla.h"
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm90/prefill/sparse/fwd.h"
+#include "sm90/prefill/sparse/convert_indice.h"
 #include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
 #include "sm100/prefill/sparse/fwd.h"
@@ -478,6 +479,184 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     return {out, max_logits, lse};
 }
 
+at::Tensor swa_sparse_fwd(
+    const at::Tensor &q,
+    const at::Tensor &win_kvcache,
+    const at::Tensor &win_block_ids,
+    const at::Tensor &win_topk_ids,
+    const std::optional<at::Tensor> &compress_kvcache,
+    const std::optional<at::Tensor> &compress_block_ids,
+    const std::optional<at::Tensor> &compress_topk_ids,
+    const at::Tensor &cu_seqlens_q,
+    const std::optional<at::Tensor> &sinks,
+    const std::optional<at::Tensor> &output = std::nullopt,
+    float sm_scale = 1.0
+) {
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(win_kvcache);
+    CHECK_DEVICE(win_block_ids);
+    CHECK_DEVICE(cu_seqlens_q);
+
+    TORCH_CHECK(q.dtype() == torch::kBFloat16);
+    TORCH_CHECK(win_kvcache.dtype() == torch::kBFloat16);
+    TORCH_CHECK(win_block_ids.dtype() == torch::kInt32);
+    TORCH_CHECK(win_topk_ids.dtype() == torch::kInt32);
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32);
+
+    // Check ndims
+    TORCH_CHECK(q.dim() == 3);
+    TORCH_CHECK(win_kvcache.dim() == 4);
+    TORCH_CHECK(win_block_ids.dim() == 2);
+    TORCH_CHECK(win_topk_ids.dim() == 2);
+    TORCH_CHECK(cu_seqlens_q.dim() == 1);
+
+    // There can be empty sinks.
+    if (sinks.has_value()) {
+        CHECK_DEVICE(sinks.value());
+        TORCH_CHECK(sinks.value().dtype() == torch::kFloat32);
+    }
+
+    // There can be empty compress_kvcache, compress_block_ids, compress_topk_ids
+    bool has_compress_kvcache = compress_kvcache.has_value();
+    if (has_compress_kvcache) {
+        CHECK_DEVICE(compress_kvcache.value());
+        CHECK_DEVICE(compress_block_ids.value());
+        CHECK_DEVICE(compress_topk_ids.value());
+        TORCH_CHECK(compress_kvcache.value().dtype() == torch::kBFloat16);
+        TORCH_CHECK(compress_block_ids.value().dtype() == torch::kInt32);
+        TORCH_CHECK(compress_topk_ids.value().dtype() == torch::kInt32);
+        TORCH_CHECK(compress_kvcache.value().dim() == 4);
+        TORCH_CHECK(compress_block_ids.value().dim() == 2);
+        TORCH_CHECK(compress_topk_ids.value().dim() == 2);
+    }
+
+    // The device.
+    int device = at::cuda::current_device();
+    // Get number of SMs from device attributes
+    int num_sms;
+    cudaError_t res = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+    if (res != cudaSuccess) {
+        TORCH_CHECK(false, "Failed to get number of SMs from device attributes");
+    }
+
+    // paged kv block size.
+    int block_size = win_kvcache.size(1);
+    TORCH_CHECK(win_kvcache.size(1) == block_size);
+
+    // Max number of window blocks.
+    int max_win_blocks = win_block_ids.size(1);
+    // Max number of compress blocks.
+    int max_compress_blocks = has_compress_kvcache ? compress_block_ids.value().size(1) : 0;
+
+    // batch size.
+    int b = win_block_ids.size(0);
+    // Q [num_total_tokens_q, num_head_q, num_dim]
+    int s_q = q.size(0);
+    // SWA KV [num_win_blocks, block_size, num_head_kv, num_dim]
+    int win_s_kv = win_kvcache.size(0) * win_kvcache.size(1);
+    // Compress KV [num_compress_blocks, block_size, num_head_kv, num_dim]
+    int s_kv = has_compress_kvcache ? compress_kvcache.value().size(0) * compress_kvcache.value().size(1) : 0;
+    int h_q = q.size(1);
+    int h_kv = win_kvcache.size(2);
+    int d_qk = q.size(2);
+    int swa_size = win_topk_ids.size(1);
+    int topk = has_compress_kvcache ? compress_topk_ids.value().size(1) : 0;
+    int d_v = win_kvcache.size(-1);
+    // It can be none when there are no sinks
+    if (sinks.has_value()) {
+        CHECK_SHAPE(sinks.value(), h_q);
+    }
+    float *sinks_ptr = sinks.has_value() ? sinks.value().data_ptr<float>() : nullptr;
+
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(win_kvcache.stride(-1) == 1);
+    TORCH_CHECK(win_topk_ids.stride(-1) == 1);
+    if (has_compress_kvcache) {
+        TORCH_CHECK(compress_kvcache.value().stride(-1) == 1);
+        TORCH_CHECK(compress_block_ids.value().stride(-1) == 1);
+        TORCH_CHECK(compress_topk_ids.value().stride(-1) == 1);
+    }
+
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto opts = q.options();
+    at::Tensor out;
+    if (output.has_value()) {
+        TORCH_CHECK(output.value().dtype() == torch::kBFloat16);
+        CHECK_SHAPE(output.value(), s_q, h_q, d_v);
+        out = output.value();
+    } else {
+        out = torch::empty({s_q, h_q, d_v}, opts);
+    }
+    CHECK_CONTIGUOUS(out);
+
+    // Allocate buffers for compressed global indices with shape of [s_q, topk or win_topk_ids]
+    at::Tensor swa_global_indices = torch::empty({s_q, swa_size}, opts.dtype(torch::kInt32));
+    CHECK_CONTIGUOUS(swa_global_indices);
+    at::Tensor compress_global_indices;
+    if (has_compress_kvcache) {
+        compress_global_indices = torch::empty({s_q, topk}, opts.dtype(torch::kInt32));
+    } else {
+        compress_global_indices = torch::empty({0}, opts.dtype(torch::kInt32));
+    }
+    CHECK_CONTIGUOUS(compress_global_indices);
+
+    // Convert SWA and compress indices to global indices
+    sm90::convert_swa_compress_to_global_ids(
+        (int*)win_block_ids.data_ptr(),
+        (int*)win_topk_ids.data_ptr(),
+        (int*)swa_global_indices.data_ptr(),
+        (int*)(has_compress_kvcache ? compress_block_ids.value().data_ptr() : nullptr),
+        (int*)(has_compress_kvcache ? compress_topk_ids.value().data_ptr() : nullptr),
+        (int*)compress_global_indices.data_ptr(),
+        (int*)cu_seqlens_q.data_ptr(),
+        s_q, b, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, num_sms, at::cuda::getCurrentCUDAStream().stream()
+    );
+
+    // print swa_global_indices and compress_global_indices torch tensors.
+    // printf("swa_global_indices \n");
+    // std::cout << swa_global_indices << std::endl;
+    // printf("topk_ids \n");
+    // std::cout << compress_topk_ids << std::endl;
+    // printf("compress_global_indices \n");
+    // std::cout << compress_global_indices << std::endl;
+
+    // at::Tensor buf_attn_score, max_logits, lse, p_sum;
+    // max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    // lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    // CHECK_CONTIGUOUS(max_logits);
+    // CHECK_CONTIGUOUS(lse);
+
+    SparsePrefillParams params = {
+        s_q, s_kv, win_s_kv, h_q, h_kv, d_qk, d_v, topk,
+        sm_scale, sm_scale * 1.44269504f,
+
+        (cutlass::bfloat16_t*)q.data_ptr(),
+        (cutlass::bfloat16_t*)(has_compress_kvcache ? compress_kvcache.value().data_ptr() : nullptr),
+        (cutlass::bfloat16_t*)win_kvcache.data_ptr(),
+        (int*)compress_global_indices.data_ptr(),
+        (int*)swa_global_indices.data_ptr(),
+
+        sinks_ptr,
+
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        has_compress_kvcache ? int64_stride_to_int(compress_kvcache.value().stride(1)) : 0,
+        has_compress_kvcache ? int64_stride_to_int(compress_kvcache.value().stride(2)) : 0,
+        int64_stride_to_int(win_kvcache.stride(1)), int64_stride_to_int(win_kvcache.stride(2)),
+        has_compress_kvcache ? int64_stride_to_int(compress_global_indices.stride(0)) : 0,
+        has_compress_kvcache ? int64_stride_to_int(compress_global_indices.stride(1)) : 0,
+        
+        (cutlass::bfloat16_t*)out.data_ptr(),
+        (float*)nullptr,
+        (float*)nullptr,
+
+        at::cuda::getCurrentCUDAStream().stream()
+    };
+
+    sm90::run_fwd_kernel(params);
+
+    return out;
+}
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -487,4 +666,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+    m.def("swa_sparse_fwd", &swa_sparse_fwd);
 }

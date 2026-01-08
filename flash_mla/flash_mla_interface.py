@@ -114,6 +114,99 @@ def flash_mla_sparse_fwd(
     )
     return results
 
+def index_attention_with_kvcache_bf16(
+    q: torch.Tensor,
+    win_kvcache: torch.Tensor,
+    win_block_ids: torch.Tensor,
+    win_topk_ids: torch.Tensor,
+    compress_kvcache: torch.Tensor,
+    compress_block_ids: torch.Tensor,
+    compress_topk_ids: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    sink_weight: torch.Tensor,
+    sm_scale: float,
+    output: torch.Tensor = None,
+) -> torch.Tensor:
+
+    """Computes index attention prefill using bfloat16 precision.
+
+    This function performs the index attention computation using custom hardware
+    operations optimized for bfloat16 data type. The prefill stage processes all
+    input tokens simultaneously to generate the initial attention context, which
+    is typically used during the first forward pass of autoregressive models.
+
+    Args:
+        q: Query tensor for attention computation
+           Shape: [num_total_tokens_q, num_head_q, num_dim]
+           Dtype: bfloat16
+
+        win_kvcache: Sliding window kvcache tensor for attention computation in paged format.
+            Constraint: the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_win_blocks, block_size, num_head_kv, num_dim]
+            Dtype: bfloat16
+
+        win_block_ids: Sliding window paged kvcache block index tensor for get paged kvcache.
+            Shape: [num_batch, num_max_win_blocks]
+            Dtype: int32
+
+        win_topk_ids: Sliding window topk index for select kvcache
+            Shape: [num_total_tokens, num_win_topk]
+            Dtype: int32
+
+        compress_kvcache: Compress 4/128 kvcache tensor for attention computation in paged format.
+            Constraint: the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_compress_blocks, block_size, num_head_kv, num_dim]
+            Dtype: bfloat16
+
+        compress_block_ids: Compress 4/128 paged kvcache block index tensor for get paged kvcache.
+            Shape: [num_batch, num_max_compress_blocks]
+            Dtype: int32
+
+        compress_topk_ids: Compress 4/128 topk index for select kvcache
+            Shape: [num_total_tokens_q, num_compress_topk]
+            Dtype: int32
+
+        cu_seqlens_q: start_seq_q for each batch
+            Shape: [num_batch + 1]
+            Dtype: int32
+
+        sink_weight:
+            Shape: [num_batch, num_head_q]
+            Dtype: float32
+        
+        sm_scale: float
+
+    Returns:
+        Tensor: Attention output tensor in bfloat16 format on CUDA device
+            Shape: [num_total_tokens_q, num_head_q, num_dim]
+            Dtype: bfloat16
+    """
+
+    # print shape of all input tensors
+    # print(f"q shape: {q.shape}")
+    # print(f"win_kvcache shape: {win_kvcache.shape}")
+    # print(f"win_block_ids shape: {win_block_ids.shape}")
+    # print(f"win_topk_ids shape: {win_topk_ids.shape}")
+    # print(f"compress_kvcache shape: {compress_kvcache.shape}")
+    # print(f"compress_block_ids shape: {compress_block_ids.shape}")
+    # print(f"compress_topk_ids shape: {compress_topk_ids.shape}")
+    # print(f"cu_seqlens_q shape: {cu_seqlens_q.shape}")
+    # print(f"sink_weight shape: {sink_weight.shape}")
+
+    output = flash_mla_cuda.swa_sparse_fwd(q,
+                                            win_kvcache,
+                                            win_block_ids,
+                                            win_topk_ids,
+                                            compress_kvcache,
+                                            compress_block_ids,
+                                            compress_topk_ids,
+                                            cu_seqlens_q,
+                                            sink_weight,
+                                            output,
+                                            sm_scale)
+
+    return output
+
 
 def _flash_attn_varlen_forward(
     q: torch.Tensor,

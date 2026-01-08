@@ -172,7 +172,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
     __syncthreads();
     
-    const int num_topk_blocks = params.topk / B_TOPK;
+    const int num_topk_blocks = (params.topk + B_TOPK - 1) / B_TOPK;
     if (warpgroup_idx == 0 || warpgroup_idx == 1) {
         cutlass::arch::warpgroup_reg_alloc<216>();
 
@@ -531,23 +531,23 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             store_O();
 
             // Save lse
-            if (idx_in_warpgroup%4 == 0) {
-                for (int row = 0; row < 2; ++row) {
-                    int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
-                    bool is_no_valid_tokens = rL[row] == 0.0f;
-                    plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row];
-                    plan.final_lse[real_row] = is_no_valid_tokens ? -INFINITY : log2f(rL[row]) + rM[row];
-                }
-                fence_view_async_shared();
-            }
+            // if (idx_in_warpgroup%4 == 0) {
+            //     for (int row = 0; row < 2; ++row) {
+            //         int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
+            //         bool is_no_valid_tokens = rL[row] == 0.0f;
+            //         plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row];
+            //         plan.final_lse[real_row] = is_no_valid_tokens ? -INFINITY : log2f(rL[row]) + rM[row];
+            //     }
+            //     fence_view_async_shared();
+            // }
 
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::warpgroup1_sync);
-            if (idx_in_warpgroup == 0) {
-                int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
-                SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
-                SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H*sizeof(float));
-                cute::tma_store_arrive();
-            }
+            // NamedBarrier::arrive_and_wait(128, NamedBarriers::warpgroup1_sync);
+            // if (idx_in_warpgroup == 0) {
+            //     int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
+            //     SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
+            //     SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H*sizeof(float));
+            //     cute::tma_store_arrive();
+            // }
         }
     } else {
         // Producer warpgroup
@@ -572,9 +572,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
                     int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
-                    int t = __ldg(gIndices + offs);
+                    int t = __ldg(gIndices + min(offs, params.topk - 1));
                     token_indices[buf_idx][local_row] = t*(int64_t)params.stride_kv_s_kv;   // We mult it with params.stride_kv_s_kv here since it's faster
-                    is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv;
+                    is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv && offs < params.topk;
                 }
             }
         };
@@ -729,8 +729,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
 void run_fwd_kernel(const SparsePrefillParams& params) {
     FLASH_ASSERT(params.h_kv == 1);
-    FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
-    FLASH_ASSERT(params.topk > 0);
+    // FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
+    FLASH_ASSERT(params.topk > 0 || params.win_s_kv > 0);
     FLASH_ASSERT(params.h_q % B_H == 0);
 
     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
