@@ -388,6 +388,9 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
+    const at::Tensor &win_kv,
+    const at::Tensor &win_indices,
+    const std::optional<at::Tensor> &sinks,
     float sm_scale,
     int d_v
 ) {
@@ -406,6 +409,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 
     int s_q = q.size(0);
     int s_kv = kv.size(0);
+    int win_s_kv = win_kv.size(0);
     int h_q = q.size(1);
     int h_kv = kv.size(1);
     int d_qk = q.size(2);
@@ -414,6 +418,15 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     CHECK_SHAPE(q, s_q, h_q, d_qk);
     CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
     CHECK_SHAPE(indices, s_q, h_kv, topk);
+    CHECK_SHAPE(win_kv, win_s_kv, h_kv, d_qk);
+    // Fix me: hardcode the window size to 128
+    CHECK_SHAPE(win_indices, s_q, h_kv, 128);
+    // It can be none when there are no sinks
+    if (sinks.has_value()) {
+        TORCH_CHECK(sinks.value().dtype() == torch::kFloat32);
+        CHECK_SHAPE(sinks.value(), h_q);
+    }
+    float *sinks_ptr = sinks.has_value() ? sinks.value().data_ptr<float>() : nullptr;
 
     TORCH_CHECK(q.stride(-1) == 1);
     TORCH_CHECK(kv.stride(-1) == 1);
@@ -431,15 +444,20 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     CHECK_CONTIGUOUS(lse);
 
     SparsePrefillParams params = {
-        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        s_q, s_kv, win_s_kv, h_q, h_kv, d_qk, d_v, topk,
         sm_scale, sm_scale * 1.44269504f,
 
         (cutlass::bfloat16_t*)q.data_ptr(),
         (cutlass::bfloat16_t*)kv.data_ptr(),
+        (cutlass::bfloat16_t*)win_kv.data_ptr(),
         (int*)indices.data_ptr(),
+        (int*)win_indices.data_ptr(),
+
+        sinks_ptr,
 
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(win_kv.stride(0)), int64_stride_to_int(win_kv.stride(1)),
         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
 
         (cutlass::bfloat16_t*)out.data_ptr(),

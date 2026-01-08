@@ -63,16 +63,21 @@ struct GetDecodingMetadataParams {
 };
 
 struct SparsePrefillParams {
-    int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    int s_q, s_kv, win_s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;
 
     // Input tensors
     cutlass::bfloat16_t* __restrict__ q;    // [s_q, h_q, d_qk]
     cutlass::bfloat16_t* __restrict__ kv;   // [s_kv, h_kv, d_qk]
+    cutlass::bfloat16_t* __restrict__ win_kv;   // [win_s_kv, h_kv, d_qk]
     int* __restrict__ indices;   // [s_q, h_kv, topk]
+    int* __restrict__ win_indices;   // [s_q, h_kv, win_s_kv]
+
+    float* __restrict__ sinks;   // [h_q]
 
     int stride_q_s_q; int stride_q_h_q;
     int stride_kv_s_kv; int stride_kv_h_kv;
+    int stride_win_kv_s_kv; int stride_win_kv_h_kv;
     int stride_indices_s_q; int stride_indices_h_kv;
 
     // Output tensors

@@ -14,12 +14,14 @@ namespace sm90 {
 
 using namespace cute;
 
-constexpr int D_Q = 576;
-constexpr int D_K = 576;
+constexpr int D_Q = 512;
+constexpr int D_K = 512;
 constexpr int D_V = 512;
 
 constexpr int B_H = 64;
 constexpr int B_TOPK = 64;    // TopK block size
+constexpr int SWA_SIZE = 128;    // Sliding window attention size.
+constexpr int NUM_WIN_BLOCKS = (SWA_SIZE+B_TOPK-1) / B_TOPK;    // Number of sliding window blocks.
 constexpr int NUM_THREADS = 128*3;
 static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
 
@@ -50,9 +52,9 @@ using SmemLayoutKTilesTransposed = decltype(composition(
 	Layout<Shape<Int<64*NUM_TILES>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
 ));
 
-using SmemLayoutQ = SmemLayoutQTiles<9>;
+using SmemLayoutQ = SmemLayoutQTiles<8>;
 using SmemLayoutO = SmemLayoutOTiles<8>;
-using SmemLayoutK = SmemLayoutKTiles<9>;
+using SmemLayoutK = SmemLayoutKTiles<8>;
 using SmemLayoutV = SmemLayoutKTilesTransposed<8>;
 using SmemLayoutHalfV = SmemLayoutKTilesTransposed<4>;
 
@@ -67,7 +69,7 @@ struct SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } q_o;
     array_aligned<bf16, cosize_v<SmemLayoutK>> k[2];
-    array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    array_aligned<bf16, cosize_v<SmemLayoutS>> s[2];
 
     bool is_kv_valid[2][B_TOPK];
     float2 sM[32];
@@ -140,14 +142,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int idx_in_warpgroup = threadIdx.x % 128;
+    const int idx_in_warp = threadIdx.x % 32;
 
     // Define shared tensors
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
     Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
     Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
-    Tensor sS0 = make_tensor(make_smem_ptr(plan.k[0].data()+64*512), SmemLayoutS{});    // Overlap with sK0's RoPE part
-    Tensor sS1 = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutS{});
+    Tensor sS0 = make_tensor(make_smem_ptr(plan.s[0].data()), SmemLayoutS{});    // Overlap with sK0's RoPE part
+    Tensor sS1 = make_tensor(make_smem_ptr(plan.s[1].data()), SmemLayoutS{});
 
     if (warp_idx == 0 && elect_one_sync()) {
         // Prefetch TMA descriptors
@@ -286,6 +289,13 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             float2 peer_L = plan.sL[(threadIdx.x/4)^32];
             rL[0] += peer_L.x;
             rL[1] += peer_L.y;
+            // Add sinks
+            if (params.sinks != nullptr) {
+                float sink0 = params.sinks[q_h_idx * B_H + (warp_idx % 4) * 16 + idx_in_warp/4];
+                float sink1 = params.sinks[q_h_idx * B_H + (warp_idx % 4) * 16 + idx_in_warp/4 + 8];
+                rL[0] += exp2f(sink0 * CUDART_L2E_F - rM[0]);
+                rL[1] += exp2f(sink1 * CUDART_L2E_F - rM[1]);
+            }
         };
 
         auto store_O = [&]() {
@@ -360,7 +370,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 qkt_gemm_one_tile(Warpgroup0{}, 5, false);
                 qkt_gemm_one_tile(Warpgroup0{}, 6, false);
                 qkt_gemm_one_tile(Warpgroup0{}, 7, false);
-                qkt_gemm_one_tile(Warpgroup0{}, 8, false);
+                // qkt_gemm_one_tile(Warpgroup0{}, 8, false);
                 warpgroup_commit_batch();
             };
 
@@ -388,7 +398,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             };
             
             CUTE_NO_UNROLL
-            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+            for (int block_idx = 0; block_idx < (NUM_WIN_BLOCKS+num_topk_blocks); block_idx += 2) {
                 Tensor sV0l = make_tensor(make_smem_ptr(plan.k[0].data()), SmemLayoutKTilesTransposed<4>{});
                 Tensor sV1l = make_tensor(make_smem_ptr(plan.k[1].data()), SmemLayoutKTilesTransposed<4>{});
 
@@ -437,7 +447,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
                 cur_bar_wait_phase ^= 1;
 
-                if (block_idx+2 < num_topk_blocks) {
+                if (block_idx+2 < (NUM_WIN_BLOCKS+num_topk_blocks)) {
                     // Launch the next QK^T GEMM
                     pipelined_wait_and_qkt_gemm_l();
 
@@ -466,7 +476,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 qkt_gemm_one_tile(Warpgroup1{}, 5, false);
                 qkt_gemm_one_tile(Warpgroup1{}, 6, false);
                 qkt_gemm_one_tile(Warpgroup1{}, 7, false);
-                qkt_gemm_one_tile(Warpgroup1{}, 8, false);
+                // qkt_gemm_one_tile(Warpgroup1{}, 8, false);
                 plan.bar_k1_ready[0].wait(cur_bar_wait_phase);
                 qkt_gemm_one_tile(Warpgroup1{}, 0, false);
                 qkt_gemm_one_tile(Warpgroup1{}, 1, false);
@@ -476,7 +486,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             };
             
             CUTE_NO_UNROLL
-            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+            for (int block_idx = 0; block_idx < (NUM_WIN_BLOCKS+num_topk_blocks); block_idx += 2) {
                 Tensor sV0r = make_tensor(make_smem_ptr(plan.k[0].data()+64*256), SmemLayoutKTilesTransposed<4>{});
                 Tensor sV1r = make_tensor(make_smem_ptr(plan.k[1].data()+64*256), SmemLayoutKTilesTransposed<4>{});
 
@@ -548,9 +558,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
         int group_idx = idx_in_warpgroup / GROUP_SIZE;
         int* gIndices = params.indices + s_q_idx*params.topk;   // [topk]
+        int* gWinIndices = params.win_indices + s_q_idx*SWA_SIZE;   // [h_kv, win_s_kv]
 
         bf16* my_sKV_base = &(make_tensor(make_smem_ptr(plan.k[0].data()), SmemLayoutKTiles<1>{})(group_idx, idx_in_group*8));
         bf16* my_gKV_base = params.kv + idx_in_group*8;
+        bf16* my_gWinKV_base = params.win_kv + idx_in_group*8;
         
         int64_t token_indices[2][NUM_ROWS_PER_GROUP];
         bool is_token_valid[2][NUM_ROWS_PER_GROUP];
@@ -566,6 +578,21 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 }
             }
         };
+
+        // Load sliding window token indices
+        auto load_win_token_indices = [&](int block_idx) {
+            CUTE_UNROLL
+            for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                    int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
+                    int t = __ldg(gWinIndices + offs);
+                    token_indices[buf_idx][local_row] = t*(int64_t)params.stride_win_kv_s_kv;   // We mult it with params.stride_win_kv_s_kv here since it's faster
+                    is_token_valid[buf_idx][local_row] = t >= 0 && t < params.win_s_kv;
+                }
+            }
+        };
+        
         
         int64_t cache_policy = createpolicy_evict_last();
         auto copy_tiles = [&](int block_idx, int buf_idx, int tile_start, int tile_end) {
@@ -588,11 +615,71 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             }
         };
 
+        // Copy sliding window K/V tiles from global memory to shared memory
+        auto copy_win_tiles = [&](int block_idx, int buf_idx, int tile_start, int tile_end) {
+            // Copy some K/V tiles from global memory to shared memory
+            // A tile has a shape of 64 (B_TOPK) x 64
+            // `buf_idx` is the index of the shared memory buffer, 0 or 1
+            // `tile_idx` is the index of the tile to load, from 0 to D_K/64-1 = 8
+            CUTE_UNROLL
+            for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                int64_t token_index = token_indices[buf_idx][local_row];
+                CUTE_UNROLL
+                for (int tile_idx = tile_start; tile_idx < tile_end; ++tile_idx) {
+                    cp_async_cacheglobal_l2_prefetch_256B(
+                        my_gWinKV_base + token_index + tile_idx*64,
+                        my_sKV_base + (buf_idx*B_TOPK*D_K + tile_idx*(B_TOPK*64) + local_row*NUM_GROUPS*64),
+                        is_token_valid[buf_idx][local_row],
+                        cache_policy
+                    );
+                }
+            }
+        };
+
         auto commit_to_mbar = [&](transac_bar_t &bar) {
             cutlass::arch::cpasync_barrier_arrive_noinc((uint64_t*)(&bar));
         };
 
         int cur_bar_wait_phase = 1;
+
+        CUTE_NO_UNROLL
+        for (int block_idx = 0; block_idx < NUM_WIN_BLOCKS; block_idx += 2) {
+            load_win_token_indices(block_idx);
+
+
+            // V0L
+            plan.bar_k0_free[0].wait(cur_bar_wait_phase);
+            copy_win_tiles(block_idx+0, 0, 0, 4);
+            commit_to_mbar(plan.bar_k0_ready[0]);
+
+            // V1R
+            plan.bar_k1_free[1].wait(cur_bar_wait_phase);
+            copy_win_tiles(block_idx+1, 1, 4, 8);
+            commit_to_mbar(plan.bar_k1_ready[1]);
+            
+            // V0R
+            plan.bar_k0_free[1].wait(cur_bar_wait_phase);
+            copy_win_tiles(block_idx+0, 0, 4, 8);
+            commit_to_mbar(plan.bar_k0_ready[1]);
+
+            // V1L
+            plan.bar_k1_free[0].wait(cur_bar_wait_phase);
+            copy_win_tiles(block_idx+1, 1, 0, 4);
+            commit_to_mbar(plan.bar_k1_ready[0]);
+
+            // Valid mask
+            // NOTE V1R's finish implies maskings of the last round have finished
+            if (idx_in_group == 0) {
+                CUTE_UNROLL
+                for (int buf_idx = 0; buf_idx < 2; ++buf_idx)
+                    CUTE_UNROLL
+                    for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row)
+                        plan.is_kv_valid[buf_idx][local_row*NUM_GROUPS+group_idx] = is_token_valid[buf_idx][local_row];
+                plan.bar_is_kv_valid_ready.arrive();
+            }
+
+            cur_bar_wait_phase ^= 1;
+        }
 
         CUTE_NO_UNROLL
         for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
@@ -605,12 +692,12 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
             // V1R
             plan.bar_k1_free[1].wait(cur_bar_wait_phase);
-            copy_tiles(block_idx+1, 1, 4, 9);
+            copy_tiles(block_idx+1, 1, 4, 8);
             commit_to_mbar(plan.bar_k1_ready[1]);
             
             // V0R
             plan.bar_k0_free[1].wait(cur_bar_wait_phase);
-            copy_tiles(block_idx+0, 0, 4, 9);
+            copy_tiles(block_idx+0, 0, 4, 8);
             commit_to_mbar(plan.bar_k0_ready[1]);
 
             // V1L
@@ -647,6 +734,7 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
     FLASH_ASSERT(params.h_q % B_H == 0);
 
     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
+
     auto tma_Q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(

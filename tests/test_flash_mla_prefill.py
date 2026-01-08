@@ -16,11 +16,13 @@ class TestParam:
     s_q: int
     s_kv: int
     topk: int
-    h_q: int = 128
+    win_s_kv: int = 128
+    h_q: int = 64
     h_kv: int = 1
-    d_qk: int = 576
+    d_qk: int = 512
     d_v: int = 512
     seed: int = 0
+    has_sinks: bool = False
     check_correctness: bool = True
     benchmark: bool = True
 
@@ -30,6 +32,9 @@ class Testcase:
     q: torch.Tensor
     kv: torch.Tensor
     indices: torch.Tensor
+    win_kv: torch.Tensor
+    win_indices: torch.Tensor
+    sinks: torch.Tensor
 
 def generate_testcase(t: TestParam) -> Testcase:
     torch.manual_seed(t.seed)
@@ -37,6 +42,7 @@ def generate_testcase(t: TestParam) -> Testcase:
     random.seed(t.seed)
     q = torch.randn((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16) / 10
     kv = torch.randn((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16) / 10
+    win_kv = torch.randn((t.b, t.win_s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16) / 10
 
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
@@ -55,17 +61,29 @@ def generate_testcase(t: TestParam) -> Testcase:
                 indices[b, s, h] = cur_indices
     indices = indices.to(q.device)
 
+    # Arrange indices in the window from [0, win_s_kv) and expand it to [s_q, win_s_kv]
+    win_indices = torch.arange(t.win_s_kv, dtype=torch.int32, device=q.device).unsqueeze(0).expand(t.b, t.s_q, t.h_kv, -1).contiguous()
+    
+    # Attention sinks with range of float [2, 3]
+    if t.has_sinks:
+        sinks = torch.rand(t.h_q, dtype=torch.float32, device=q.device) / 10
+    else:
+        sinks = None
+
     return Testcase(
         t=t,
         q=q,
         kv=kv,
-        indices=indices
+        win_kv=win_kv,
+        indices=indices,
+        win_indices=win_indices,
+        sinks=sinks
     )
 
 def get_flop(p: TestParam) -> float:
     flop = 2 * sum([
-        p.h_q * p.d_qk * p.topk,
-        p.h_q * p.d_v * p.topk
+        p.h_q * p.d_qk * (p.topk + p.win_s_kv),
+        p.h_q * p.d_v * (p.topk + p.win_s_kv)
     ]) * p.b * p.s_q
     return flop
 
@@ -75,16 +93,28 @@ def reference_torch(p: TestParam, t: Testcase, sm_scale: float) -> Tuple[torch.T
 
     assert p.b == 1
     indices = t.indices[0, :, 0, :]  # [s_q, topk]
+    win_indices = t.win_indices[0, :, 0, :]  # [s_q, win_s_kv]
     invalid_indices_mask = (indices < 0) | (indices >= p.s_kv)
+    invalid_win_indices_mask = (win_indices < 0) | (win_indices >= p.win_s_kv)
     qs = t.q[0, :, :, :].float()  # [s_q, h_q, d_qk]
     kvs = t.kv[0, :, 0, :].float()  # [s_kv, d_qk]
 
     kvs = torch.index_select(kvs, 0, indices.masked_fill(invalid_indices_mask, 0).flatten()).view(p.s_q, p.topk, p.d_qk)  # [s_q, topk, d_qk]
+    # concat win_kv
+    if p.win_s_kv > 0:
+        win_kvs = t.win_kv[0, :, 0, :].float()  # [win_s_kv, d_qk]
+        win_kvs = win_kvs.expand(p.s_q, p.win_s_kv, p.d_qk)
+        kvs = torch.cat([win_kvs, kvs], dim=1)  # [s_q, topk + win_s_kv, d_qk]
+        invalid_indices_mask = torch.cat([invalid_win_indices_mask, invalid_indices_mask], dim=1)
     attn_score = qs @ kvs.transpose(1, 2)    # [s_q, h_q, topk]
     attn_score.masked_fill_(invalid_indices_mask.unsqueeze(1), float('-inf'))
     attn_score *= sm_scale * math.log2(math.e)
     max_logits = torch.max(attn_score, dim=-1)[0]   # [s_q, h_q]
+    if t.sinks is not None:
+        attn_score = torch.concat([attn_score, t.sinks.view(p.h_q, 1).expand(p.s_q, p.h_q, 1)], dim=-1)
     lse = log2sumexp2(attn_score, dim=-1)   # [s_q, h_q]
+    if t.sinks is not None:
+       attn_score = attn_score[:, :, :-1]
     attn_score = torch.exp2(attn_score - lse.unsqueeze(-1))   # [s_q, h_q, topk]
     result = attn_score @ kvs[:, :, :p.d_v]
     return (max_logits, lse, result)
@@ -102,7 +132,7 @@ def run_test(p: TestParam) -> bool:
 
     def run_ans():
         return flash_mla_sparse_fwd(
-            t.q.squeeze(0), t.kv.squeeze(0), t.indices.squeeze(0), sm_scale=sm_scale
+            t.q.squeeze(0), t.kv.squeeze(0), t.indices.squeeze(0), t.win_kv.squeeze(0), t.win_indices.squeeze(0), t.sinks, sm_scale=sm_scale
         )
 
     ans_out, ans_max_logits, ans_lse = run_ans()
@@ -138,7 +168,7 @@ if __name__ == '__main__':
 
     correctness_cases = [
         # Regular shapes
-        TestParam(1, s_q, s_kv, topk, h_q=128, benchmark=False)
+        TestParam(1, s_q, s_kv, topk, has_sinks=has_sinks, h_q=64, benchmark=False)
         for s_kv, topk in [
             # Regular shapes
             (128, 128),
@@ -159,11 +189,12 @@ if __name__ == '__main__':
         for s_q in [
             1, 62
         ]
+        for has_sinks in [True, False]
     ]
 
     corner_cases = [
         # In these cases, some blocks may not have any valid topk indices
-        TestParam(1, s_q, s_kv, topk, h_q=128, benchmark=False)
+        TestParam(1, s_q, s_kv, topk, h_q=64, benchmark=False)
         for s_kv, topk in [
             (32, 2048),
             (64, 8192)
@@ -172,10 +203,10 @@ if __name__ == '__main__':
     ]
 
     performance_cases = [
-        TestParam(1, s_q, s_kv, topk, h_q=128)
+        TestParam(1, s_q, s_kv, topk, h_q=64)
         for s_q in [4096]
         for s_kv in [4096, 8192, 16384, 32768, 49152, 65536, 81920, 98304, 114688, 131072]
-        for topk in [2048]
+        for topk in [512, 2048]
     ]
 
     testcases = correctness_cases + corner_cases + performance_cases

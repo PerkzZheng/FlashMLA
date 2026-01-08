@@ -83,6 +83,9 @@ def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
+    win_kv: torch.Tensor,
+    win_indices: torch.Tensor,
+    sinks: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -93,6 +96,9 @@ def flash_mla_sparse_fwd(
         q: [s_q, h_q, d_qk], bfloat16
         kv: [s_kv, h_kv, d_qk], bfloat16
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
+        win_kv: [win_s_kv, h_kv, d_qk], bfloat16
+        win_indices: [s_q, h_kv, win_s_kv], int32. Invalid/Masked indices should be set to -1.
+        sinks: [h_q], float. attention sinks.
         sm_scale: float
         d_v: The dimension of value vectors. Can only be 512
 
@@ -104,7 +110,7 @@ def flash_mla_sparse_fwd(
         - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
     results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v
+        q, kv, indices, win_kv, win_indices, sinks, sm_scale, d_v
     )
     return results
 
