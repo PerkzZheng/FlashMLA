@@ -150,7 +150,7 @@ void convert_swa_compress_to_global_ids(
     int threads_per_block = 256;
 
     // Each thread converts four indices at a time.
-    dim3 grid((num_sms * 4) / batch_size, batch_size);
+    dim3 grid((num_sms * 8) / batch_size, batch_size);
     
     // Assert block size is power of 2.
     FLASH_ASSERT((block_size & (block_size - 1)) == 0);

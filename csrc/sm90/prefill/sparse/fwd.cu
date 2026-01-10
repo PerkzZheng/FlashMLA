@@ -12,6 +12,10 @@
 
 namespace sm90 {
 
+__host__ __device__ int32_t divUp(int32_t a, int32_t b) {
+    return (a + b - 1) / b;
+}
+
 using namespace cute;
 
 constexpr int D_Q = 512;
@@ -137,8 +141,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __grid_constant__ const TmaParams tma_params) {
     // NOTE This kernel uses a similar schedule to Flash MLA - 0422. For a detailed explanation, please refer to https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20250422-new-kernel-deep-dive.md
 #if IS_SM90
-    const int q_h_idx = blockIdx.x % (params.h_q/B_H);
-    const int s_q_idx = blockIdx.x / (params.h_q/B_H);
+    // const int q_h_idx = blockIdx.x % (params.h_q/B_H);
+    // const int s_q_idx = blockIdx.x / (params.h_q/B_H);
+    const int q_h_idx = 0;
+    const int s_q_idx = blockIdx.x;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int idx_in_warpgroup = threadIdx.x % 128;
@@ -731,7 +737,7 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
     FLASH_ASSERT(params.h_kv == 1);
     // FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     FLASH_ASSERT(params.topk > 0 || params.win_s_kv > 0);
-    FLASH_ASSERT(params.h_q % B_H == 0);
+    // FLASH_ASSERT(params.h_q % B_H == 0);
 
     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
 
@@ -782,7 +788,7 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
-        dim3((params.h_q/B_H)*params.s_q, 1, 1),    // NOTE We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
+        dim3(divUp(params.h_q, B_H)*params.s_q, 1, 1),    // NOTE We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
         dim3(NUM_THREADS, 1, 1),
         dim3(1, 1, 1),
         smem_size,

@@ -279,9 +279,10 @@ if __name__ == '__main__':
     ]
 
     ds_new_cases = [
-        TestParam(8, s, s, topk, h_q=64, benchmark=False)
+        TestParam(8, s, s, topk, h_q=h_q, benchmark=False)
             for s in [592, 1840, 1592, 1521, 95, 153, 114]
             for topk in [0, 512, 812]
+            for h_q in [16, 64]
     ]
 
     corner_cases = [
