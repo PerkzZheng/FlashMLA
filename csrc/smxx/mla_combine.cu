@@ -10,9 +10,9 @@
 
 using namespace cute;
 
-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
+template<typename ElementT, typename ParamsT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
+flash_fwd_mla_combine_kernel(__grid_constant__ const ParamsT params) {
     // grid_shape: [batch_size, num_q_heads*s_q / BLOCK_SIZE_M]
     // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
@@ -94,7 +94,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
             sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
 
         float global_lse = (sum_lse == 0.f || sum_lse != sum_lse) ? INFINITY : log2f(sum_lse) + max_lse;
-        if (lane_idx == 0)
+        if (lane_idx == 0 && params.softmax_lse_ptr != nullptr)
             gLse(warp_idx) = global_lse / (float)M_LOG2E;
 
         CUTLASS_PRAGMA_UNROLL
@@ -174,15 +174,15 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
     }()
 
 
-template<typename ElementT>
-void run_flash_mla_combine_kernel(DecodingParams &params, cudaStream_t stream) {
+template<typename ElementT, typename ParamsT>
+void run_flash_mla_combine_kernel(ParamsT &params, cudaStream_t stream) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
         constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
         constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
+        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, ParamsT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
         CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
         cudaLaunchAttribute attribute[1];
@@ -201,8 +201,16 @@ void run_flash_mla_combine_kernel(DecodingParams &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template void run_flash_mla_combine_kernel<cutlass::bfloat16_t>(DecodingParams &params, cudaStream_t stream);
+// Explicit instantiations for DecodingParams
+template void run_flash_mla_combine_kernel<cutlass::bfloat16_t, DecodingParams>(DecodingParams &params, cudaStream_t stream);
 
 #ifndef FLASH_MLA_DISABLE_FP16
-template void run_flash_mla_combine_kernel<cutlass::half_t>(DecodingParams &params, cudaStream_t stream);
+template void run_flash_mla_combine_kernel<cutlass::half_t, DecodingParams>(DecodingParams &params, cudaStream_t stream);
+#endif
+
+// Explicit instantiations for SparsePrefillParams
+template void run_flash_mla_combine_kernel<cutlass::bfloat16_t, SparsePrefillParams>(SparsePrefillParams &params, cudaStream_t stream);
+
+#ifndef FLASH_MLA_DISABLE_FP16
+template void run_flash_mla_combine_kernel<cutlass::half_t, SparsePrefillParams>(SparsePrefillParams &params, cudaStream_t stream);
 #endif

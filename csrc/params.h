@@ -63,6 +63,9 @@ struct GetDecodingMetadataParams {
 };
 
 struct SparsePrefillParams {
+    using index_t = int64_t;
+     
+    // s_q denotes total_s_q in a batch for prefill, and s_q denotes the squence length Q for a single sequence in decoding.
     int s_q, s_kv, win_s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;
 
@@ -84,6 +87,24 @@ struct SparsePrefillParams {
     cutlass::bfloat16_t* __restrict__ out;   // [s_q, h_q, d_v]
     float* __restrict__ max_logits; // [s_q, h_q]
     float* __restrict__ lse; // [s_q, h_q]
+
+    // Split-KV related fields (also used for metadata kernel)
+    int* __restrict__ tile_scheduler_metadata_ptr;
+    int num_sm_parts;
+    int* __restrict__ num_splits_ptr;
+    int total_num_splits;
+    float* __restrict__ softmax_lseaccum_ptr;   // [total_num_splits, h_q]
+    float* __restrict__ oaccum_ptr;             // [total_num_splits, h_q, d_v]
+
+    // Combine kernel compatibility fields (mirrors DecodingParams interface)
+    int b;              // batch size (same as batch_size, for combine kernel)
+    int q_seq_per_hk;   // number of q sequences per KV head = s_q * (h_q / h_kv)
+    int h_k;            // number of KV heads (same as h_kv)
+    void* __restrict__ softmax_lse_ptr;   // pointer to softmax_lse (same as lse)
+    void* __restrict__ o_ptr;             // pointer to output (same as out)
+    index_t o_batch_stride;
+    index_t o_head_stride;
+    index_t o_row_stride;
 
     cudaStream_t stream;
 };

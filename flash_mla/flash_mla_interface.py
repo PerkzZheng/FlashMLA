@@ -124,6 +124,9 @@ def index_attention_with_kvcache_bf16(
     compress_topk_ids: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     sink_weight: torch.Tensor,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    is_decode: bool,
     sm_scale: float,
     output: torch.Tensor = None,
 ) -> torch.Tensor:
@@ -173,7 +176,17 @@ def index_attention_with_kvcache_bf16(
         sink_weight:
             Shape: [num_batch, num_head_q]
             Dtype: float32
+
+        tile_scheduler_metadata: Tile scheduler metadata tensor returned by get_mla_metadata.
+            Shape: [num_sm_parts, TileSchedulerMetaDataSize]
+            Dtype: int32
+
+        num_splits: Number of splits tensor returned by get_mla_metadata.
+            Shape: [num_batch + 1]
+            Dtype: int32
         
+        is_decode: Boolean, True if it is used in decoding, False otherwise.
+    
         sm_scale: float
 
     Returns:
@@ -202,7 +215,10 @@ def index_attention_with_kvcache_bf16(
                                             compress_topk_ids,
                                             cu_seqlens_q,
                                             sink_weight,
+                                            tile_scheduler_metadata,
+                                            num_splits,
                                             output,
+                                            is_decode,
                                             sm_scale)
 
     return output

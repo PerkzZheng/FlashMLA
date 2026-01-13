@@ -90,6 +90,7 @@ ext_modules.append(
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
                 "--use_fast_math",
+                "-lineinfo",
                 "--ptxas-options=-v,--register-usage-level=10"
             ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),
         },

@@ -7,7 +7,7 @@ import dataclasses
 import torch
 import triton
 
-from flash_mla import flash_mla_sparse_fwd, index_attention_with_kvcache_bf16
+from flash_mla import flash_mla_sparse_fwd, index_attention_with_kvcache_bf16, get_mla_metadata
 from lib import check_is_allclose
 
 @dataclasses.dataclass
@@ -24,6 +24,7 @@ class TestParam:
     block_size: int = 64
     seed: int = 0
     has_sinks: bool = False
+    is_decode: bool = False
     check_correctness: bool = True
     benchmark: bool = True
 
@@ -31,6 +32,7 @@ class TestParam:
 class Testcase:
     t: TestParam
     cu_seqlens_q: torch.Tensor
+    cache_seqlens: torch.Tensor
     q: torch.Tensor
     kv: torch.Tensor
     indices: torch.Tensor
@@ -107,7 +109,9 @@ def generate_testcase(t: TestParam) -> Testcase:
     for b in range(t.b):
         cu_seqlens_q[b + 1] = cu_seqlens_q[b] + t.s_q
 
-    # Attention sinks with range of float [2, 3]
+    cache_seqlens = torch.full((t.b,), t.topk + t.win_s_kv, dtype=torch.int32, device=q.device)
+
+    # Attention sinks 
     if t.has_sinks:
         sinks = torch.rand(t.h_q, dtype=torch.float32, device=q.device) / 10
     else:
@@ -116,6 +120,7 @@ def generate_testcase(t: TestParam) -> Testcase:
     return Testcase(
         t=t,
         cu_seqlens_q=cu_seqlens_q,
+        cache_seqlens=cache_seqlens,
         q=q,
         kv=kv,
         paged_kv=paged_kv,
@@ -189,20 +194,16 @@ def run_test(p: TestParam) -> bool:
     sm_scale = 1 / math.sqrt(p.d_qk)
     torch.cuda.synchronize()
 
-
-    # def index_attention_with_kvcache_bf16(
-    #         q: Tensor,
-    #         win_kvcache: Tensor,
-    #         win_block_ids: Tensor,
-    #         win_topk_ids: Tensor,
-    #         compress_kvcache: Tensor,
-    #         compress_block_ids: Tensor,
-    #         compress_topk_ids: Tensor,
-    #         cu_seqlens_q: Tensor,
-    #         sink_weight: Tensor,
-    #         sm_scale: float,
-    #         output: Tensor = None,
-    #     ) -> Tensor:
+    tile_scheduler_metadata, num_splits = None, None
+    if p.is_decode:
+        tile_scheduler_metadata, num_splits = get_mla_metadata(
+            t.cache_seqlens,
+            p.s_q * p.h_q // p.h_kv,
+            p.h_kv,
+            p.h_q,
+            False,
+            -1,
+        )
 
     def run_ans():
         # return flash_mla_sparse_fwd(
@@ -218,6 +219,9 @@ def run_test(p: TestParam) -> bool:
             t.indices.view(-1, p.topk) if t.indices is not None else None,
             t.cu_seqlens_q,
             t.sinks,
+            tile_scheduler_metadata,
+            num_splits,
+            is_decode=p.is_decode,
             sm_scale=sm_scale
         )
 
@@ -226,7 +230,7 @@ def run_test(p: TestParam) -> bool:
 
     if p.benchmark:
         flop = get_flop(p)
-        prefill_ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20) / 1000  # type: ignore
+        prefill_ans_time: float = triton.testing.do_bench_cudagraph(run_ans, rep=50) / 1000  # type: ignore
         prefill_flops = flop / prefill_ans_time / 1e12
         print(f"Prefill:  {prefill_ans_time * 1e6:4.0f} us, {prefill_flops:.3f} TFlops")
 
@@ -254,7 +258,7 @@ if __name__ == '__main__':
 
     correctness_cases = [
         # Regular shapes
-        TestParam(1, s_q, s_kv, topk, has_sinks=has_sinks, h_q=64, benchmark=False)
+        TestParam(1, s_q, s_kv, topk, has_sinks=has_sinks, is_decode=False, h_q=64, benchmark=False)
         for s_kv, topk in [
             # Regular shapes
             (128, 128),
@@ -278,16 +282,24 @@ if __name__ == '__main__':
         for has_sinks in [True, False]
     ]
 
-    ds_new_cases = [
-        TestParam(8, s, s, topk, h_q=h_q, benchmark=False)
+    ds_new_prefill_cases = [
+        TestParam(8, s, s, topk, h_q=h_q, is_decode=False, benchmark=False)
             for s in [592, 1840, 1592, 1521, 95, 153, 114]
             for topk in [0, 512, 812]
             for h_q in [16, 64]
     ]
 
+    ds_new_decoding_cases = [
+        TestParam(bs, s_q, s_kv, topk, h_q=64, has_sinks=True, is_decode=True, benchmark=False)
+        for s_q in [1, 2]
+        for s_kv in [4096]
+        for topk in [0, 512, 812]
+        for bs in [1, 2, 4, 8, 128]
+    ]
+
     corner_cases = [
         # In these cases, some blocks may not have any valid topk indices
-        TestParam(1, s_q, s_kv, topk, h_q=64, benchmark=False)
+        TestParam(1, s_q, s_kv, topk, h_q=64, is_decode=(s_q == 1), benchmark=False)
         for s_kv, topk in [
             (32, 2048),
             (64, 8192)
@@ -295,14 +307,25 @@ if __name__ == '__main__':
         for s_q in [1, 1024]
     ]
 
-    performance_cases = [
-        TestParam(1, s_q, s_kv, topk, h_q=64)
+    performance_prefill_cases = [
+        TestParam(1, s_q, s_kv, topk, h_q=64, is_decode=decode, benchmark=True)
         for s_q in [4096]
         for s_kv in [4096]
-        for topk in [512, 1024]
+        for topk in [512]
+        for decode in [True, False]
     ]
 
-    testcases = correctness_cases + ds_new_cases + corner_cases + performance_cases
+    performance_decoding_cases = [
+        TestParam(bs, s_q, s_kv, topk, h_q=64, is_decode=True, benchmark=True)
+        for s_q in [1, 2]
+        for s_kv in [4096]
+        for topk in [512]
+        for bs in [1, 2, 4, 8]
+    ]
+
+    # testcases = correctness_cases + ds_new_cases + corner_cases + performance_cases
+    # testcases = ds_new_prefill_cases + ds_new_decoding_cases
+    testcases = ds_new_decoding_cases
 
     failed_cases = []
     for test in testcases:

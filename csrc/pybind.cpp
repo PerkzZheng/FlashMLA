@@ -73,7 +73,18 @@ DecodingAttnImplMeta get_attn_impl_meta(
                 };
             } else {
                 // Sparse BF16 MLA
-                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM90");
+                // TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM90");
+                TORCH_CHECK(h_q_.has_value());
+                int h_q = h_q_.value();
+                TORCH_CHECK(h_q % h_k == 0);
+                int s_q = num_q_tokens_per_head_k * h_k / h_q;
+                // FP8 + Sparse MLA
+                return {
+                    std::max((sm_count) / h_k / (cutlass::ceil_div(h_q/h_k, 64) * s_q), 1),
+                    5,
+                    // Note we use 128 for bf16 kv cache kernel.
+                    sm90::SPLIT_KV_BLOCK_SIZE
+                };
             }
         } else {
             if (is_fp8_kvcache) {
@@ -144,6 +155,7 @@ get_mla_decoding_metadata(
     int sm_count = dprops->multiProcessorCount;
     Arch arch = {dprops->major, dprops->minor};
     arch.assert_is_supported();
+    // fixme
     DecodingAttnImplMeta attn_impl_meta = get_attn_impl_meta(arch, sm_count, num_q_tokens_per_head_k, h_k, h_q, is_fp8_kvcache, is_sparse_attn);
 
     auto tile_scheduler_metadata = torch::empty({attn_impl_meta.num_sm_parts, TileSchedulerMetaDataSize}, options);
@@ -360,10 +372,10 @@ fwd_kvcache_mla(
     }
 
     if (q_dtype == torch::kBFloat16) {
-        run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
+        run_flash_mla_combine_kernel<cutlass::bfloat16_t, DecodingParams>(params, stream);
     } else if (q_dtype == torch::kHalf) {
 #ifndef FLASH_MLA_DISABLE_FP16
-        run_flash_mla_combine_kernel<cutlass::half_t>(params, stream);
+        run_flash_mla_combine_kernel<cutlass::half_t, DecodingParams>(params, stream);
 #endif
     } else {
         TORCH_CHECK(false, "Unsupported tensor dtype for query");
@@ -465,6 +477,24 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        // Split-KV related tensors
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        nullptr,
+
+        // Combine kernel compatibility fields
+        s_q,
+        h_q / h_kv,
+        1,
+        nullptr,
+        nullptr,
+        (SparsePrefillParams::index_t)(s_q * d_v),
+        (SparsePrefillParams::index_t)(d_v),
+        (SparsePrefillParams::index_t)(d_v),
+
         at::cuda::getCurrentCUDAStream().stream()
     };
 
@@ -489,7 +519,10 @@ at::Tensor swa_sparse_fwd(
     const std::optional<at::Tensor> &compress_topk_ids,
     const at::Tensor &cu_seqlens_q,
     const std::optional<at::Tensor> &sinks,
+    const std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
+    const std::optional<at::Tensor> &num_splits,                // batch_size + 1
     const std::optional<at::Tensor> &output = std::nullopt,
+    const bool is_decode = false,
     float sm_scale = 1.0
 ) {
 
@@ -515,6 +548,18 @@ at::Tensor swa_sparse_fwd(
     if (sinks.has_value()) {
         CHECK_DEVICE(sinks.value());
         TORCH_CHECK(sinks.value().dtype() == torch::kFloat32);
+    }
+
+    // If it is decode, then tile_scheduler_metadata and num_splits must be provided.
+    if (is_decode) {
+        TORCH_CHECK(tile_scheduler_metadata.has_value(), "tile_scheduler_metadata must be provided when is_decode is True");
+        TORCH_CHECK(num_splits.has_value(), "num_splits must be provided when is_decode is True");
+        CHECK_DEVICE(tile_scheduler_metadata.value());
+        CHECK_DEVICE(num_splits.value());
+        TORCH_CHECK(tile_scheduler_metadata.value().dtype() == torch::kInt32);
+        TORCH_CHECK(num_splits.value().dtype() == torch::kInt32);
+        CHECK_CONTIGUOUS(tile_scheduler_metadata.value());
+        CHECK_CONTIGUOUS(num_splits.value());
     }
 
     // There can be empty compress_kvcache, compress_block_ids, compress_topk_ids
@@ -552,7 +597,7 @@ at::Tensor swa_sparse_fwd(
     // batch size.
     int b = win_block_ids.size(0);
     // Q [num_total_tokens_q, num_head_q, num_dim]
-    int s_q = q.size(0);
+    int total_s_q = q.size(0);
     // SWA KV [num_win_blocks, block_size, num_head_kv, num_dim]
     int win_s_kv = win_kvcache.size(0) * win_kvcache.size(1);
     // Compress KV [num_compress_blocks, block_size, num_head_kv, num_dim]
@@ -583,19 +628,19 @@ at::Tensor swa_sparse_fwd(
     at::Tensor out;
     if (output.has_value()) {
         TORCH_CHECK(output.value().dtype() == torch::kBFloat16);
-        CHECK_SHAPE(output.value(), s_q, h_q, d_v);
+        CHECK_SHAPE(output.value(), total_s_q, h_q, d_v);
         out = output.value();
     } else {
-        out = torch::empty({s_q, h_q, d_v}, opts);
+        out = torch::empty({total_s_q, h_q, d_v}, opts);
     }
     CHECK_CONTIGUOUS(out);
 
-    // Allocate buffers for compressed global indices with shape of [s_q, topk or win_topk_ids]
-    at::Tensor swa_global_indices = torch::empty({s_q, swa_size}, opts.dtype(torch::kInt32));
+    // Allocate buffers for compressed global indices with shape of [total_s_q, topk or win_topk_ids]
+    at::Tensor swa_global_indices = torch::empty({total_s_q, swa_size}, opts.dtype(torch::kInt32));
     CHECK_CONTIGUOUS(swa_global_indices);
     at::Tensor compress_global_indices;
     if (has_compress_kvcache) {
-        compress_global_indices = torch::empty({s_q, topk}, opts.dtype(torch::kInt32));
+        compress_global_indices = torch::empty({total_s_q, topk}, opts.dtype(torch::kInt32));
     } else {
         compress_global_indices = torch::empty({0}, opts.dtype(torch::kInt32));
     }
@@ -610,7 +655,7 @@ at::Tensor swa_sparse_fwd(
         (int*)(has_compress_kvcache ? compress_topk_ids.value().data_ptr() : nullptr),
         (int*)compress_global_indices.data_ptr(),
         (int*)cu_seqlens_q.data_ptr(),
-        s_q, b, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, num_sms, at::cuda::getCurrentCUDAStream().stream()
+        total_s_q, b, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, num_sms, at::cuda::getCurrentCUDAStream().stream()
     );
 
     // print swa_global_indices and compress_global_indices torch tensors.
@@ -622,13 +667,37 @@ at::Tensor swa_sparse_fwd(
     // std::cout << compress_global_indices << std::endl;
 
     // at::Tensor buf_attn_score, max_logits, lse, p_sum;
-    // max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    // lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    // max_logits = torch::empty({total_s_q, h_q}, opts.dtype(torch::kFloat));
+    // lse = torch::empty({total_s_q, h_q}, opts.dtype(torch::kFloat));
     // CHECK_CONTIGUOUS(max_logits);
     // CHECK_CONTIGUOUS(lse);
 
+    const int q_head_per_hk = h_q / h_kv;
+    const int s_q = cutlass::ceil_div(total_s_q, b);
+    const int q_seq_per_hk = s_q * q_head_per_hk;
+    
+    // Allocate split-KV accumulator tensors
+    int num_sm_parts = 0;
+    int total_num_splits = 0;
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+    if (is_decode) {
+        num_sm_parts = tile_scheduler_metadata.value().size(0);
+        total_num_splits = b + num_sm_parts;
+        softmax_lse_accum = torch::empty({total_num_splits, q_seq_per_hk}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({total_num_splits, q_seq_per_hk, d_v}, opts.dtype(at::kFloat));
+        CHECK_CONTIGUOUS(softmax_lse_accum);
+        CHECK_CONTIGUOUS(out_accum);
+    } else {
+        softmax_lse_accum = torch::empty({0}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({0}, opts.dtype(at::kFloat));
+    }
+
+    // The stream
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
     SparsePrefillParams params = {
-        s_q, s_kv, win_s_kv, h_q, h_kv, d_qk, d_v, topk,
+        is_decode ? s_q : total_s_q, s_kv, win_s_kv, h_q, h_kv, d_qk, d_v, topk,
         sm_scale, sm_scale * 1.44269504f,
 
         (cutlass::bfloat16_t*)q.data_ptr(),
@@ -650,10 +719,35 @@ at::Tensor swa_sparse_fwd(
         (float*)nullptr,
         (float*)nullptr,
 
-        at::cuda::getCurrentCUDAStream().stream()
+        // Split-KV related fields
+        is_decode ? tile_scheduler_metadata.value().data_ptr<int>() : nullptr,   // tile_scheduler_metadata_ptr
+        num_sm_parts,                              // num_sm_parts
+        is_decode ? num_splits.value().data_ptr<int>() : nullptr,                // num_splits_ptr
+        total_num_splits,                          // total_num_splits
+        softmax_lse_accum.data_ptr<float>(),       // softmax_lseaccum_ptr
+        out_accum.data_ptr<float>(),               // oaccum_ptr
+
+        // Combine kernel compatibility fields
+        b,                                         // b (single batch for combine)
+        q_seq_per_hk,                              // q_seq_per_hk
+        h_kv,                                      // h_k
+        (void*)nullptr,                            // softmax_lse_ptr (output lse, set if needed)
+        (void*)out.data_ptr(),                     // o_ptr
+        (SparsePrefillParams::index_t)(q_seq_per_hk * d_v),  // o_batch_stride
+        (SparsePrefillParams::index_t)(d_v),         // o_head_stride
+        (SparsePrefillParams::index_t)(d_v),         // o_row_stride
+
+        stream
     };
 
-    sm90::run_fwd_kernel(params);
+    // If it is decode, then use split-KV kernel. Otherwise, use normal kernel.
+    if (is_decode) {
+        sm90::run_fwd_splitkv_kernel(params);
+        // Call mla_combine kernel afterwards to merge results from all partitions
+        run_flash_mla_combine_kernel<cutlass::bfloat16_t, SparsePrefillParams>(params, stream);
+    } else {
+        sm90::run_fwd_kernel(params);
+    }
 
     return out;
 }

@@ -36,6 +36,8 @@ __global__ void convert_swa_compress_fused_kernel(
         return;
     }
 
+    cudaGridDependencySynchronize();
+
     // The token_offset is the offset of the token in the batch.
     int token_offset = cu_seqlens[batch_idx];
     // The seq_len_q.
@@ -126,6 +128,8 @@ __global__ void convert_swa_compress_fused_kernel(
             }
         }
     }
+
+    cudaTriggerProgrammaticLaunchCompletion();
 }
 
 void convert_swa_compress_to_global_ids(
@@ -160,8 +164,19 @@ void convert_swa_compress_to_global_ids(
     // Assert win_topk is divisible by 4.
     FLASH_ASSERT(win_topk % 4 == 0);
 
-    // Launch the kernel
-    convert_swa_compress_fused_kernel<<<grid, threads_per_block, 0, stream>>>(
+    // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+    cudaLaunchAttribute kernel_attributes[1];
+    kernel_attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t kernel_config = {
+        grid,
+        dim3(threads_per_block, 1, 1),
+        0,  // dynamicSmemBytes
+        stream,
+        kernel_attributes,
+        1
+    };
+    cudaLaunchKernelEx(&kernel_config, convert_swa_compress_fused_kernel,
         win_block_ids,
         win_topk_ids,
         win_global_ids,

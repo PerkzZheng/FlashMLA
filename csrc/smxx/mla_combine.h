@@ -2,5 +2,5 @@
 
 #include "params.h"
 
-template<typename ElementT>
-void run_flash_mla_combine_kernel(DecodingParams &params, cudaStream_t stream);
+template<typename ElementT, typename ParamsT>
+void run_flash_mla_combine_kernel(ParamsT &params, cudaStream_t stream);
