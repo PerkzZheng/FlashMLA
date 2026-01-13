@@ -21,6 +21,7 @@ namespace sm90 {
  * @param cu_seqlens: [batch_size + 1], int32 - Cumulative sequence lengths
  * @param num_tokens: Total number of query tokens
  * @param batch_size: Number of batches
+ * @param max_seqlen_q: Maximum sequence length of query
  * @param win_topk: Number of window indices per token
  * @param compress_topk: Number of compress indices per token
  * @param block_size: Size of each block in the paged KV cache (typically 64)
@@ -39,6 +40,7 @@ void convert_swa_compress_to_global_ids(
     const int* cu_seqlens,
     int num_tokens,
     int batch_size,
+    int max_seqlen_q,
     int win_topk,
     int compress_topk,
     int block_size,

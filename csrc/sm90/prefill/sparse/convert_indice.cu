@@ -142,6 +142,7 @@ void convert_swa_compress_to_global_ids(
     const int* cu_seqlens,
     int num_tokens,
     int batch_size,
+    int max_seqlen_q,
     int win_topk,
     int compress_topk,
     int block_size,
@@ -154,7 +155,7 @@ void convert_swa_compress_to_global_ids(
     int threads_per_block = 256;
 
     // Each thread converts four indices at a time.
-    dim3 grid((num_sms * 8) / batch_size, batch_size);
+    dim3 grid(std::min((num_sms * 8) / batch_size, max_seqlen_q), batch_size);
     
     // Assert block size is power of 2.
     FLASH_ASSERT((block_size & (block_size - 1)) == 0);

@@ -323,9 +323,7 @@ if __name__ == '__main__':
         for bs in [1, 2, 4, 8]
     ]
 
-    # testcases = correctness_cases + ds_new_cases + corner_cases + performance_cases
-    # testcases = ds_new_prefill_cases + ds_new_decoding_cases
-    testcases = ds_new_decoding_cases
+    testcases = correctness_cases + ds_new_prefill_cases + ds_new_decoding_cases + corner_cases + performance_prefill_cases + performance_decoding_cases
 
     failed_cases = []
     for test in testcases:

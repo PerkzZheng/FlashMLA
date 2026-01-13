@@ -646,6 +646,11 @@ at::Tensor swa_sparse_fwd(
     }
     CHECK_CONTIGUOUS(compress_global_indices);
 
+    const int q_head_per_hk = h_q / h_kv;
+    const int s_q = cutlass::ceil_div(total_s_q, b);
+    const int max_s_q = is_decode ? s_q : total_s_q;
+    const int q_seq_per_hk = s_q * q_head_per_hk;
+
     // Convert SWA and compress indices to global indices
     sm90::convert_swa_compress_to_global_ids(
         (int*)win_block_ids.data_ptr(),
@@ -655,12 +660,16 @@ at::Tensor swa_sparse_fwd(
         (int*)(has_compress_kvcache ? compress_topk_ids.value().data_ptr() : nullptr),
         (int*)compress_global_indices.data_ptr(),
         (int*)cu_seqlens_q.data_ptr(),
-        total_s_q, b, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, num_sms, at::cuda::getCurrentCUDAStream().stream()
+        total_s_q, b, max_s_q, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, num_sms, at::cuda::getCurrentCUDAStream().stream()
     );
 
     // print swa_global_indices and compress_global_indices torch tensors.
     // printf("swa_global_indices \n");
-    // std::cout << swa_global_indices << std::endl;
+    // for (int i = 0; i < s_q; i++)
+    // {
+    //     std::cout << swa_global_indices[i] << std::endl;
+    // }
+
     // printf("topk_ids \n");
     // std::cout << compress_topk_ids << std::endl;
     // printf("compress_global_indices \n");
@@ -672,10 +681,6 @@ at::Tensor swa_sparse_fwd(
     // CHECK_CONTIGUOUS(max_logits);
     // CHECK_CONTIGUOUS(lse);
 
-    const int q_head_per_hk = h_q / h_kv;
-    const int s_q = cutlass::ceil_div(total_s_q, b);
-    const int q_seq_per_hk = s_q * q_head_per_hk;
-    
     // Allocate split-KV accumulator tensors
     int num_sm_parts = 0;
     int total_num_splits = 0;
@@ -689,6 +694,7 @@ at::Tensor swa_sparse_fwd(
         CHECK_CONTIGUOUS(softmax_lse_accum);
         CHECK_CONTIGUOUS(out_accum);
     } else {
+        num_sm_parts = num_sms;
         softmax_lse_accum = torch::empty({0}, opts.dtype(at::kFloat));
         out_accum = torch::empty({0}, opts.dtype(at::kFloat));
     }
