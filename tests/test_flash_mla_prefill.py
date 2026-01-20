@@ -27,6 +27,7 @@ class TestParam:
     is_decode: bool = False
     check_correctness: bool = True
     benchmark: bool = True
+    use_topk_length: bool = False  # If True, generate per-query topk_length
 
 @dataclasses.dataclass
 class Testcase:
@@ -43,6 +44,8 @@ class Testcase:
     win_paged_kv: torch.Tensor
     win_paged_block_ids: torch.Tensor
     sinks: torch.Tensor
+    prefill_topk_length: torch.Tensor  # [b * s_q] or None - per-query topk length
+    decode_topk_length: torch.Tensor  # [b] or None - per-request topk length
 
 def generate_testcase(t: TestParam) -> Testcase:
     torch.manual_seed(t.seed)
@@ -54,6 +57,17 @@ def generate_testcase(t: TestParam) -> Testcase:
 
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
+
+    # Generate per-query topk_length if requested
+    prefill_topk_length = torch.full((t.b * t.s_q,), min(t.topk, t.s_kv), dtype=torch.int32, device=q.device)
+    decode_topk_length = torch.full((t.b,), min(t.topk, t.s_kv), dtype=torch.int32, device=q.device)
+    if t.use_topk_length and t.topk > 0:
+        # Generate random topk_length for each query, between 1 and topk
+        total_s_q = t.b * t.s_q
+        prefill_topk_length = torch.randint(1, min(t.topk, t.s_kv) + 1, (total_s_q,), dtype=torch.int32, device=q.device)
+        # Make sure at least some queries use the full topk to test edge cases
+        prefill_topk_length[::4] = min(t.topk, t.s_kv)
+        decode_topk_length = prefill_topk_length.view(t.b, t.s_q).max(dim=-1)[0]
 
     indices = None
     if t.topk > 0:
@@ -69,11 +83,16 @@ def generate_testcase(t: TestParam) -> Testcase:
                         cur_indices = torch.cat([cur_indices, torch.full((t.topk - len(cur_indices),), 2147480000)])
                     cur_indices = cur_indices[torch.randperm(t.topk)]
                     indices[b, s, h] = cur_indices
+                    # Apply per-query topk_length masking
+                    indices[b, s, h, prefill_topk_length[b * t.s_q + s]:] = -1
         indices = indices.to(q.device)
 
     # Arrange indices in the window from [0, win_s_kv) and expand it to [s_q, win_s_kv]
     win_indices = torch.arange(t.win_s_kv, dtype=torch.int32, device=q.device).unsqueeze(0).expand(t.b, t.s_q, t.h_kv, -1).contiguous()
-    
+    # Add win_s_kv to topk_length
+    prefill_topk_length += t.win_s_kv
+    decode_topk_length += t.win_s_kv
+
     # Create paged kv.
     paged_kv = None
     paged_block_ids = None
@@ -130,7 +149,9 @@ def generate_testcase(t: TestParam) -> Testcase:
         win_paged_block_ids=win_paged_block_ids,
         indices=indices,
         win_indices=win_indices,
-        sinks=sinks
+        sinks=sinks,
+        prefill_topk_length=prefill_topk_length,
+        decode_topk_length=decode_topk_length
     )
 
 def get_flop(p: TestParam) -> float:
@@ -197,7 +218,7 @@ def run_test(p: TestParam) -> bool:
     tile_scheduler_metadata, num_splits = None, None
     if p.is_decode:
         tile_scheduler_metadata, num_splits = get_mla_metadata(
-            t.cache_seqlens,
+            t.decode_topk_length,
             p.s_q * p.h_q // p.h_kv,
             p.h_kv,
             p.h_q,
@@ -222,7 +243,9 @@ def run_test(p: TestParam) -> bool:
             tile_scheduler_metadata,
             num_splits,
             is_decode=p.is_decode,
-            sm_scale=sm_scale
+            sm_scale=sm_scale,
+            prefill_topk_length=t.prefill_topk_length,
+            decode_topk_length=t.decode_topk_length
         )
 
     ans_out = run_ans()
@@ -290,11 +313,12 @@ if __name__ == '__main__':
     ]
 
     ds_new_decoding_cases = [
-        TestParam(bs, s_q, s_kv, topk, h_q=64, has_sinks=True, is_decode=True, benchmark=False)
+        TestParam(bs, s_q, s_kv, topk, h_q=64, has_sinks=True, is_decode=True, use_topk_length=use_topk_length, benchmark=False)
         for s_q in [1, 2]
         for s_kv in [4096]
         for topk in [0, 512, 812]
         for bs in [1, 2, 4, 8, 128]
+        for use_topk_length in [False, True]
     ]
 
     corner_cases = [

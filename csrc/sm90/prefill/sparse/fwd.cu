@@ -202,7 +202,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
     cudaGridDependencySynchronize();
     
-    const int num_topk_blocks = (params.topk + B_TOPK - 1) / B_TOPK;
     if (warpgroup_idx == 0 || warpgroup_idx == 1) {
         cutlass::arch::warpgroup_reg_alloc<216>();
 
@@ -217,6 +216,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             // Compute work indices from tile_idx
             const int q_h_idx = 0;
             const int s_q_idx = tile_idx; 
+
+            // Get prefill topk length (use params.topk if topk_length is nullptr)
+            const int cur_topk = params.prefill_topk_length ? (params.prefill_topk_length[s_q_idx] - SWA_SIZE) : params.topk;
+            const int num_topk_blocks = (cur_topk + B_TOPK - 1) / B_TOPK;
 
             float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}; // Meaning: the `max_logits` used for O / rL calculation
             float rL[2] = {0.0f, 0.0f};
@@ -617,6 +620,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             const int q_h_idx = 0;
             const int s_q_idx = tile_idx;
 
+            // Get prefill topk length (use params.topk if topk_length is nullptr)
+            const int cur_topk = params.prefill_topk_length ? (params.prefill_topk_length[s_q_idx] - SWA_SIZE) : params.topk;
+            const int num_topk_blocks = (cur_topk + B_TOPK - 1) / B_TOPK;
+
             // Make sure the previous tile is finished
             plan.bar_q_free.wait(cur_bar_wait_phase_q);
 
@@ -652,9 +659,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
                         int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
-                        int t = __ldg(gIndices + min(offs, params.topk - 1));
+                        int t = __ldg(gIndices + min(offs, cur_topk - 1));
                         token_indices[buf_idx][local_row] = t*(int64_t)params.stride_kv_s_kv;   // We mult it with params.stride_kv_s_kv here since it's faster
-                        is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv && offs < params.topk;
+                        is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv && offs < cur_topk;
                     }
                 }
             };
@@ -848,15 +855,21 @@ sparse_attn_fwd_splitkv_kernel(__grid_constant__ const SparsePrefillParams param
     
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
     
+    // Helper to get per-query topk length that includes swa_size
+    auto get_cur_topk = [&](int batch_idx) -> int {
+        return params.decode_topk_length ? params.decode_topk_length[batch_idx] : (params.topk + SWA_SIZE);
+    };
+    
     // Calculate block range for this partition
     auto get_cur_req_info = [&](int batch_idx) -> std::tuple<int, int, bool> {
+        int cur_topk = get_cur_topk(batch_idx);
         int start_block_idx = batch_idx == begin_idx ? sched_begin_block_idx : 0;
-        const int total_blocks = (SWA_SIZE + params.topk + SPLIT_KV_BLOCK_SIZE - 1) / SPLIT_KV_BLOCK_SIZE;
+        const int total_blocks = (cur_topk + SPLIT_KV_BLOCK_SIZE - 1) / SPLIT_KV_BLOCK_SIZE;
         int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : total_blocks;
         const bool is_no_split = start_block_idx == 0 && end_block_idx == total_blocks;
         // Note that B_TOPK might be smaller than SPLIT_KV_BLOCK_SIZE, so we need to adjust the end_block_idx accordingly.
         start_block_idx *= (SPLIT_KV_BLOCK_SIZE / B_TOPK);
-        end_block_idx = min(end_block_idx * (SPLIT_KV_BLOCK_SIZE / B_TOPK), NUM_WIN_BLOCKS + (params.topk + B_TOPK - 1) / B_TOPK);
+        end_block_idx = min(end_block_idx * (SPLIT_KV_BLOCK_SIZE / B_TOPK), (cur_topk + B_TOPK - 1) / B_TOPK);
         return {start_block_idx, end_block_idx, is_no_split};
     };
 
@@ -1314,6 +1327,8 @@ sparse_attn_fwd_splitkv_kernel(__grid_constant__ const SparsePrefillParams param
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
             auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
             
+            // Get per-query topk length that excludes swa_size
+            const int cur_topk = get_cur_topk(batch_idx) - SWA_SIZE;
 
             if (warp_idx == 8 && elect_one_sync()) {
                 // Wait for the previous Q to be freed.
@@ -1349,9 +1364,9 @@ sparse_attn_fwd_splitkv_kernel(__grid_constant__ const SparsePrefillParams param
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
                         int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
-                        int t = __ldg(gIndices + min(offs, params.topk - 1));
+                        int t = __ldg(gIndices + min(offs, cur_topk - 1));
                         token_indices[buf_idx][local_row] = t*(int64_t)params.stride_kv_s_kv;
-                        is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv && offs < params.topk;
+                        is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv && offs < cur_topk;
                     }
                 }
             };
@@ -1448,7 +1463,7 @@ sparse_attn_fwd_splitkv_kernel(__grid_constant__ const SparsePrefillParams param
 
             // Process topk blocks within range
             int topk_start = max(eff_start - NUM_WIN_BLOCKS, 0);
-            int topk_end = min(eff_end - NUM_WIN_BLOCKS, (params.topk + B_TOPK - 1) / B_TOPK);
+            int topk_end = min(eff_end - NUM_WIN_BLOCKS, (cur_topk + B_TOPK - 1) / B_TOPK);
 
             CUTE_NO_UNROLL
             for (int block_idx = topk_start; block_idx < topk_end; block_idx += 2) {

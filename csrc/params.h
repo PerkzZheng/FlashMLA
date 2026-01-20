@@ -75,6 +75,8 @@ struct SparsePrefillParams {
     cutlass::bfloat16_t* __restrict__ win_kv;   // [win_s_kv, h_kv, d_qk]
     int* __restrict__ indices;   // [s_q, h_kv, topk]
     int* __restrict__ win_indices;   // [s_q, h_kv, win_s_kv]
+    int* __restrict__ prefill_topk_length;   // [s_q] - per-query topk length for prefill, nullptr means use params.topk for all. This should include swa_size.
+    int* __restrict__ decode_topk_length;   // [num_batch] - per-request topk length, nullptr means use params.topk for all. This should include swa_size.
 
     float* __restrict__ sinks;   // [h_q]
 

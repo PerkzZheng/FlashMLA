@@ -465,6 +465,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         (cutlass::bfloat16_t*)win_kv.data_ptr(),
         (int*)indices.data_ptr(),
         (int*)win_indices.data_ptr(),
+        nullptr,
+        nullptr,
 
         sinks_ptr,
 
@@ -519,6 +521,8 @@ at::Tensor swa_sparse_fwd(
     const std::optional<at::Tensor> &compress_topk_ids,
     const at::Tensor &cu_seqlens_q,
     const std::optional<at::Tensor> &sinks,
+    const std::optional<at::Tensor> &prefill_topk_length,   // [s_q] - per-query topk length for prefill, optional. this should include swa_size.
+    const std::optional<at::Tensor> &decode_topk_length,   // [num_batch] - per-request topk length, optional. this should include swa_size.
     const std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
     const std::optional<at::Tensor> &num_splits,                // batch_size + 1
     const std::optional<at::Tensor> &output = std::nullopt,
@@ -613,6 +617,24 @@ at::Tensor swa_sparse_fwd(
         CHECK_SHAPE(sinks.value(), h_q);
     }
     float *sinks_ptr = sinks.has_value() ? sinks.value().data_ptr<float>() : nullptr;
+
+    // prefill_topk_length is optional - if not provided, use topk for all queries
+    if (prefill_topk_length.has_value()) {
+        CHECK_DEVICE(prefill_topk_length.value());
+        TORCH_CHECK(prefill_topk_length.value().dtype() == torch::kInt32);
+        CHECK_SHAPE(prefill_topk_length.value(), total_s_q);
+        CHECK_CONTIGUOUS(prefill_topk_length.value());
+    }
+    int *prefill_topk_length_ptr = prefill_topk_length.has_value() ? prefill_topk_length.value().data_ptr<int>() : nullptr;
+
+    // decode_topk_length is optional - if not provided, use topk for all requests
+    if (decode_topk_length.has_value()) {
+        CHECK_DEVICE(decode_topk_length.value());
+        TORCH_CHECK(decode_topk_length.value().dtype() == torch::kInt32);
+        CHECK_SHAPE(decode_topk_length.value(), b);
+        CHECK_CONTIGUOUS(decode_topk_length.value());
+    }
+    int *decode_topk_length_ptr = decode_topk_length.has_value() ? decode_topk_length.value().data_ptr<int>() : nullptr;
 
     TORCH_CHECK(q.stride(-1) == 1);
     TORCH_CHECK(win_kvcache.stride(-1) == 1);
@@ -711,6 +733,8 @@ at::Tensor swa_sparse_fwd(
         (cutlass::bfloat16_t*)win_kvcache.data_ptr(),
         (int*)compress_global_indices.data_ptr(),
         (int*)swa_global_indices.data_ptr(),
+        prefill_topk_length_ptr,
+        decode_topk_length_ptr,
 
         sinks_ptr,
 

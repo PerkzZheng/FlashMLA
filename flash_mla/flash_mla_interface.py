@@ -129,6 +129,8 @@ def index_attention_with_kvcache_bf16(
     is_decode: bool,
     sm_scale: float,
     output: torch.Tensor = None,
+    prefill_topk_length: Optional[torch.Tensor] = None,
+    decode_topk_length: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     """Computes index attention prefill using bfloat16 precision.
@@ -189,6 +191,16 @@ def index_attention_with_kvcache_bf16(
     
         sm_scale: float
 
+        prefill_topk_length: Optional per-query topk length tensor for prefill.
+            Shape: [num_total_tokens_q]
+            Dtype: int32
+            If None, uses the topk dimension from compress_topk_ids for all queries.
+
+        decode_topk_length: Optional per-request topk length tensor.
+            Shape: [num_batch]
+            Dtype: int32
+            If None, uses the topk dimension from compress_topk_ids for all requests.
+
     Returns:
         Tensor: Attention output tensor in bfloat16 format on CUDA device
             Shape: [num_total_tokens_q, num_head_q, num_dim]
@@ -215,6 +227,8 @@ def index_attention_with_kvcache_bf16(
                                             compress_topk_ids,
                                             cu_seqlens_q,
                                             sink_weight,
+                                            prefill_topk_length,
+                                            decode_topk_length,
                                             tile_scheduler_metadata,
                                             num_splits,
                                             output,
