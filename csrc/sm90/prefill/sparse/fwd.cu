@@ -1107,7 +1107,7 @@ sparse_attn_fwd_splitkv_kernel(__grid_constant__ const SparsePrefillParams param
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < B_H / (256/32); ++local_row) {
                         int row = local_row * (256/32) + (threadIdx.x / 32);
-                        if (row < B_H) {
+                        if (row < params.h_q) {
                             SM90_BULK_COPY_S2G::copy(&sOAccumBuf(row, _0{}), gOAccum + row * D_V, D_V*sizeof(float));
                         }
                     }
@@ -1115,7 +1115,7 @@ sparse_attn_fwd_splitkv_kernel(__grid_constant__ const SparsePrefillParams param
                 }
                 
                 // Store lse
-                if (threadIdx.x < B_H) {
+                if (threadIdx.x < params.h_q) {
                     gLseAccum[threadIdx.x] = plan.final_lse[threadIdx.x];
                 }
             };

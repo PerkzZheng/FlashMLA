@@ -313,12 +313,13 @@ if __name__ == '__main__':
     ]
 
     ds_new_decoding_cases = [
-        TestParam(bs, s_q, s_kv, topk, h_q=64, has_sinks=True, is_decode=True, use_topk_length=use_topk_length, benchmark=False)
+        TestParam(bs, s_q, s_kv, topk, h_q=h_q, has_sinks=True, is_decode=True, use_topk_length=use_topk_length, benchmark=False)
         for s_q in [1, 2]
         for s_kv in [4096]
         for topk in [0, 512, 812]
         for bs in [1, 2, 4, 8, 128]
         for use_topk_length in [False, True]
+        for h_q in [16, 64]
     ]
 
     corner_cases = [
