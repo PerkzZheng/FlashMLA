@@ -26,7 +26,9 @@ __global__ void convert_swa_compress_fused_kernel(
     int compress_topk,
     int block_size_log2,
     int max_win_blocks,
-    int max_compress_blocks
+    int max_compress_blocks,
+    int64_t win_stride_0,
+    int64_t compress_stride_0
 ) {
     // Batch index.
     int batch_idx = blockIdx.y;
@@ -56,6 +58,7 @@ __global__ void convert_swa_compress_fused_kernel(
             int4 topk_ids = make_int4(-1, -1, -1, -1);
             const int* block_table;
             int max_num_blocks;
+            int64_t stride_0;
 
             // The offset of the ids.
             int64_t ids_offset = 0;
@@ -65,6 +68,7 @@ __global__ void convert_swa_compress_fused_kernel(
                 topk_ids = *reinterpret_cast<const int4*>(win_topk_ids + ids_offset);
                 block_table = win_block_ids;
                 max_num_blocks = max_win_blocks;
+                stride_0 = win_stride_0;
             } else {
                 ids_offset = (token_offset + q_idx) * int64_t(compress_topk) + index_pos - win_topk;
                 // No guarantee that the compress_topk_ids is divisible by 4, so we need to load one by one.
@@ -82,6 +86,7 @@ __global__ void convert_swa_compress_fused_kernel(
                 }
                 block_table = compress_block_ids;
                 max_num_blocks = max_compress_blocks;
+                stride_0 = compress_stride_0;
             }
             
             // Handle invalid indices (marked as -1) and convert to global IDs
@@ -98,7 +103,7 @@ __global__ void convert_swa_compress_fused_kernel(
                     // Check bounds
                     if (page_block_index < max_num_blocks) {
                         // Look up the physical block position from the block table
-                        int physical_block_position = block_table[batch_idx * int64_t(max_num_blocks) + page_block_index];
+                        int physical_block_position = block_table[batch_idx * stride_0 + page_block_index];
                         
                         // Handle invalid block table entries and compute global index
                         if (physical_block_position >= 0) {
@@ -148,6 +153,8 @@ void convert_swa_compress_to_global_ids(
     int block_size,
     int max_win_blocks,
     int max_compress_blocks,
+    int64_t win_stride_0,
+    int64_t compress_stride_0,
     int num_sms,
     cudaStream_t stream
 ) {
@@ -191,7 +198,9 @@ void convert_swa_compress_to_global_ids(
         compress_topk,
         block_size_log2,
         max_win_blocks,
-        max_compress_blocks
+        max_compress_blocks,
+        win_stride_0,
+        compress_stride_0
     );
 }
 

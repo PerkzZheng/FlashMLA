@@ -595,8 +595,12 @@ at::Tensor swa_sparse_fwd(
 
     // Max number of window blocks.
     int max_win_blocks = win_block_ids.size(1);
+    // Stride0 of win_block_ids
+    int64_t win_stride_0 = win_block_ids.stride(0);
     // Max number of compress blocks.
     int max_compress_blocks = has_compress_kvcache ? compress_block_ids.value().size(1) : 0;
+    // Stride0 of compress_block_ids
+    int64_t compress_stride_0 = has_compress_kvcache ? compress_block_ids.value().stride(0) : 0;
 
     // batch size.
     int b = win_block_ids.size(0);
@@ -682,7 +686,7 @@ at::Tensor swa_sparse_fwd(
         (int*)(has_compress_kvcache ? compress_topk_ids.value().data_ptr() : nullptr),
         (int*)compress_global_indices.data_ptr(),
         (int*)cu_seqlens_q.data_ptr(),
-        total_s_q, b, max_s_q, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, num_sms, at::cuda::getCurrentCUDAStream().stream()
+        total_s_q, b, max_s_q, swa_size, topk, block_size, max_win_blocks, max_compress_blocks, win_stride_0, compress_stride_0, num_sms, at::cuda::getCurrentCUDAStream().stream()
     );
 
     // print swa_global_indices and compress_global_indices torch tensors.

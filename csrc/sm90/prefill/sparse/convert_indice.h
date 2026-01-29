@@ -27,6 +27,8 @@ namespace sm90 {
  * @param block_size: Size of each block in the paged KV cache (typically 64)
  * @param max_win_blocks: Maximum number of window blocks per batch
  * @param max_compress_blocks: Maximum number of compress blocks per batch
+ * @param win_stride_0: Stride0 of win_block_ids
+ * @param compress_stride_0: Stride0 of compress_block_ids
  * @param num_sms: Number of SMs
  * @param stream: CUDA stream
  */
@@ -46,6 +48,8 @@ void convert_swa_compress_to_global_ids(
     int block_size,
     int max_win_blocks,
     int max_compress_blocks,
+    int64_t win_stride_0,
+    int64_t compress_stride_0,
     int num_sms,
     cudaStream_t stream
 );
