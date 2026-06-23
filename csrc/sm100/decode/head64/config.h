@@ -191,6 +191,8 @@ struct SharedMemoryPlan {
     transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
+    transac_bar_t bar_clc_full;
+    ku::CLCResponseObj clc_response_obj;
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(

@@ -45,6 +45,7 @@ KernelTemplate<MODEL_TYPE>
             plan.bar_last_store_done.init(128);
             plan.bar_q_tma.init(1);
             plan.bar_q_utccp.init(1);
+            plan.bar_clc_full.init(1);
             for (int i = 0; i < NUM_BUFS; ++i) {
                 plan.bar_rope_ready[i].init(1);
                 plan.bar_nope_ready[i].init(128); 
@@ -67,6 +68,7 @@ KernelTemplate<MODEL_TYPE>
     __syncthreads();
 
     struct MainLoopArgs {
+        int s_q_idx;
         int batch_idx, start_block_idx, end_block_idx;
         bool is_no_split; int n_split_idx;
         bool bar_phase_batch_rel;    // Bar phase of barriers that are used once per batch
@@ -75,6 +77,36 @@ KernelTemplate<MODEL_TYPE>
     };
 
     auto run_main_loop = [&](auto f) {
+        if (params.tile_scheduler_metadata_ptr == nullptr) {
+            ku::CLCResult next_job = {true, s_q_idx, 0, 0};
+            bool clc_phase = 0;
+            bool bar_phase_batch_rel = 0;
+            CUTE_NO_UNROLL
+            while (next_job.is_valid && next_job.x < params.s_q) {
+                MainLoopArgs args = {
+                    next_job.x,
+                    0, 0, params.topk / B_TOPK,
+                    true, 0,
+                    bar_phase_batch_rel,
+                    params.topk, 0, params.topk / B_TOPK,
+                    false
+                };
+
+                f(args);
+                NamedBarrier(NUM_THREADS, NamedBarriers::everyone_sync).arrive_and_wait_unaligned();
+
+                if (warp_idx == 0 && elect_one_sync()) {
+                    ku::issue_clc_query(plan.bar_clc_full, plan.clc_response_obj);
+                    plan.bar_clc_full.arrive_and_expect_tx(sizeof(plan.clc_response_obj));
+                }
+                plan.bar_clc_full.wait(clc_phase);
+                next_job = ku::get_clc_query_response<true>(plan.clc_response_obj);
+                clc_phase ^= 1;
+                bar_phase_batch_rel ^= 1;
+            }
+            return;
+        }
+
         // NOTE Putting the following code outside the warpgroup specialization switch results in register spilling.
         // [[maybe_unused]] int begin_req_idx, end_req_idx, sched_begin_block_idx, sched_end_block_idx, begin_n_split_idx, is_first_req_splitted, is_last_req_splitted;
         DecodingSchedMeta sched_meta;
@@ -104,6 +136,7 @@ KernelTemplate<MODEL_TYPE>
             int n_split_idx = batch_idx == sched_meta.begin_req_idx ? (__ldg(params.num_splits_ptr+batch_idx) + sched_meta.begin_split_idx) : __ldg(params.num_splits_ptr+batch_idx);
 
             MainLoopArgs args = {
+                s_q_idx,
                 batch_idx, start_block_idx, end_block_idx,
                 !is_split, n_split_idx,
                 bar_phase_batch_rel,
@@ -315,11 +348,11 @@ KernelTemplate<MODEL_TYPE>
                 if (args.is_no_split) {
                     float cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
                     cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
-                    float* gSoftmaxLse = (float*)params.lse + args.batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + idx_in_warpgroup;
+                    float* gSoftmaxLse = (float*)params.lse + args.batch_idx*params.stride_lse_b + args.s_q_idx*params.stride_lse_s_q + idx_in_warpgroup;
                     *gSoftmaxLse = cur_lse;
                 } else {
                     float cur_lse = log2f(li) + mi;
-                    float* gSoftmaxLseAccum = (float*)params.lse_accum + args.n_split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + idx_in_warpgroup;
+                    float* gSoftmaxLseAccum = (float*)params.lse_accum + args.n_split_idx*params.stride_lse_accum_split + args.s_q_idx*params.stride_lse_accum_s_q + idx_in_warpgroup;
                     *gSoftmaxLseAccum = cur_lse;
                 }
             }
@@ -334,7 +367,7 @@ KernelTemplate<MODEL_TYPE>
 
             if (args.is_no_split) {
                 Tensor tma_gO = flat_divide(
-                    tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx, args.batch_idx),
+                    tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, args.s_q_idx, args.batch_idx),
                     Shape<Int<B_H>, Int<64>>{}
                 )(_, _, _0{}, _);
                 auto thr_tma = tma_params.tma_O.get_slice(_0{});
@@ -412,7 +445,7 @@ KernelTemplate<MODEL_TYPE>
                         int smem_row = local_row*4 + warp_idx;
                         SM90_BULK_COPY_S2G::copy(
                             &sO(smem_row, _0{}),
-                            (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + smem_row*params.stride_o_accum_h_q,
+                            (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + args.s_q_idx*params.stride_o_accum_s_q + smem_row*params.stride_o_accum_h_q,
                             D_V*sizeof(float)
                         );
                     }
@@ -437,7 +470,7 @@ KernelTemplate<MODEL_TYPE>
                 }
                 // Issue Q (SW128) G->S
                 {
-                    Tensor gQ = tma_params.tma_Q_SW128.get_tma_tensor(tma_params.shape_Q_SW128)(_, _, s_q_idx, args.batch_idx);
+                    Tensor gQ = tma_params.tma_Q_SW128.get_tma_tensor(tma_params.shape_Q_SW128)(_, _, args.s_q_idx, args.batch_idx);
                     Tensor sQ = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
                     ku::launch_tma_copy(
                         tma_params.tma_Q_SW128,
@@ -455,7 +488,7 @@ KernelTemplate<MODEL_TYPE>
                         (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
                         plan.u.qo.q_sw64,
                         0, 0, 0,
-                        s_q_idx, args.batch_idx
+                        args.s_q_idx, args.batch_idx
                     );
                 }
                 plan.bar_q_tma.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
@@ -667,8 +700,8 @@ KernelTemplate<MODEL_TYPE>
                 (uint8_t*)params.extra_kv + params.extra_page_block_size*(D_NOPE+2*D_ROPE);
             
             run_main_loop([&](const MainLoopArgs &args) {
-                int* indices = (int*)params.indices + params.stride_indices_b*args.batch_idx + params.stride_indices_s_q*s_q_idx;
-                int* extra_indices = (int*)params.extra_indices + params.stride_extra_indices_b*args.batch_idx + params.stride_extra_indices_s_q*s_q_idx;
+                int* indices = (int*)params.indices + params.stride_indices_b*args.batch_idx + params.stride_indices_s_q*args.s_q_idx;
+                int* extra_indices = (int*)params.extra_indices + params.stride_extra_indices_b*args.batch_idx + params.stride_extra_indices_s_q*args.s_q_idx;
                 
                 struct IsOrigBlock {};
                 struct IsExtraBlock {};

@@ -173,6 +173,37 @@ def flash_mla_with_kvcache(
     return (out, lse)
 
 
+def flash_mla_sparse_prefill_varlen_clc(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sparse prefill kernel for flattened query tokens on Blackwell.
+
+    Args:
+        q: [total_q, num_heads_q, head_dim_qk], bfloat16.
+        k_cache: [num_blocks, page_block_size, num_heads_k, bytes_per_token].
+            The sparse FP8 KV cache layout is the same as flash_mla_with_kvcache.
+        indices: [total_q, topk], int32 KV token indices.
+        head_dim_v: value head dimension. Must be 512.
+        softmax_scale: optional softmax scale. Defaults to 1 / sqrt(head_dim_qk).
+        attn_sink: optional [num_heads_q], float32.
+
+    Returns:
+        out: [total_q, num_heads_q, head_dim_v], bfloat16.
+        softmax_lse: [total_q, num_heads_q], float32.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    return flash_mla_cuda.sparse_prefill_varlen_clc_fwd(
+        q, k_cache, indices, attn_sink, head_dim_v, softmax_scale
+    )
+
+
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,

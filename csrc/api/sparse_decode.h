@@ -493,3 +493,127 @@ sparse_attn_decode_interface(
 
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }
+
+static std::tuple<at::Tensor, at::Tensor>
+sparse_attn_prefill_varlen_clc_interface(
+    const at::Tensor &q,        // [total_q, h_q, d_qk]
+    const at::Tensor &kv,       // [num_blocks, page_block_size, h_kv, bytes_per_token]
+    const at::Tensor &indices,  // [total_q, topk]
+    const std::optional<at::Tensor> &attn_sink, // [h_q]
+    int d_v,
+    float sm_scale
+) {
+    using bf16 = cutlass::bfloat16_t;
+
+    Arch arch = Arch();
+    TORCH_CHECK(arch.is_sm100f(), "sparse_prefill_varlen_clc_fwd currently only supports sm100 Blackwell GPUs");
+
+    KU_CHECK_NDIM(q, 3);
+    KU_CHECK_NDIM(kv, 4);
+    KU_CHECK_NDIM(indices, 2);
+
+    const int total_q = q.size(0);
+    const int h_q = q.size(1);
+    const int d_qk = q.size(2);
+    const int num_blocks = kv.size(0);
+    const int page_block_size = kv.size(1);
+    const int h_kv = kv.size(2);
+    const int topk = indices.size(1);
+
+    TORCH_CHECK(total_q > 0, "total_q must be positive");
+    TORCH_CHECK(h_q == 64, "sparse_prefill_varlen_clc_fwd currently only supports num_heads_q == 64");
+    TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported for sparse decoding");
+    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Only head_size_k == 576 or 512 is supported for sparse decoding");
+    TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported for sparse decoding");
+    TORCH_CHECK(topk > 0, "topk must be positive");
+    TORCH_CHECK(topk % 64 == 0, "topk must be a multiple of 64 for sparse_prefill_varlen_clc_fwd");
+
+    KU_CHECK_DEVICE(q);
+    KU_CHECK_DEVICE(kv);
+    KU_CHECK_DEVICE(indices);
+    KU_CHECK_DEVICE(attn_sink);
+
+    KU_CHECK_DTYPE(q, torch::kBFloat16);
+    TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8,
+                "key must have dtype fp8_e4m3fn, int8 or uint8");
+    KU_CHECK_DTYPE(indices, torch::kInt32);
+    KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
+
+    KU_CHECK_LAST_DIM_CONTIGUOUS(q);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
+    KU_CHECK_CONTIGUOUS(attn_sink);
+
+    int bytes_per_token;
+    if (d_qk == 576 && d_v == 512) {
+        bytes_per_token = 512 + 64*2 + (512/128)*4;
+    } else if (d_qk == 512 && d_v == 512) {
+        bytes_per_token = 448 + 64*2 + (448/64)*1 + 1;
+    } else {
+        TORCH_CHECK(false, "Unsupported head sizes for sparse_prefill_varlen_clc_fwd");
+    }
+    KU_CHECK_SHAPE(q, total_q, h_q, d_qk);
+    KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
+    KU_CHECK_SHAPE(indices, total_q, topk);
+    KU_CHECK_SHAPE(attn_sink, h_q);
+    TORCH_CHECK(kv.stride(1) == bytes_per_token, "The whole block must be contiguous for sparse fp8 KV cache");
+
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto opts = q.options();
+    at::Tensor out = torch::empty({total_q, h_q, d_v}, opts);
+    at::Tensor lse = torch::empty({total_q, h_q}, opts.dtype(at::kFloat));
+
+    ModelType model_type;
+    if (d_qk == 576) {
+        model_type = ModelType::V32;
+    } else if (d_qk == 512) {
+        model_type = ModelType::MODEL1;
+    } else {
+        TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    SparseAttnDecodeParams params = {
+        1, total_q, h_q, h_kv, d_qk, d_v,
+        sm_scale, sm_scale * LOG_2_E,
+        num_blocks, page_block_size, topk,
+        model_type,
+
+        (bf16*)q.data_ptr(),
+        (bf16*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+        nullptr,
+        ku::get_optional_tensor_ptr<float>(attn_sink),
+        (float*)lse.data_ptr(),
+        (bf16*)out.data_ptr(),
+
+        0, 0, 0,
+        nullptr,
+        nullptr,
+        nullptr,
+
+        0, int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        0, int64_stride_to_int(indices.stride(0)),
+        0, int64_stride_to_int(lse.stride(0)),
+        0, int64_stride_to_int(out.stride(0)), int64_stride_to_int(out.stride(1)),
+        0, 0,
+        0, 0,
+        stream,
+
+        nullptr,
+        nullptr,
+        0, 0,
+        0, 0, 0,
+        nullptr,
+        nullptr,
+        1
+    };
+
+    DISPATCH_MODEL_TYPE(model_type, MODEL_TYPE, [&]() {
+        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE>(params);
+    });
+
+    return {out, lse};
+}
