@@ -76,6 +76,7 @@ struct SparseAttnFwdParams {
     SparseAttnFwdMode mode;     // Which forward mode to use (Prefill / Decode / DecodeWithSplitKV)
     int num_sm;                 // Number of SMs available for this kernel launch
     stream_t stream;
+    bool paired_indices = false;
 };
 
 // Tile scheduling metadata for split-KV decoding. Each entry describes
@@ -166,6 +167,7 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts], tile scheduling metadata
     int* __restrict__ num_splits_ptr; // [batch_size+1], cumulative split counts per request
     int num_sm_parts;               // Number of SM partitions for split-KV scheduling
+    bool paired_indices = false;
 };
 
 template<SparseAttnFwdMode FWD_MODE>

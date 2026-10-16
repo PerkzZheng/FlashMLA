@@ -44,9 +44,9 @@ void st_shared_with_cvta(void* ptr, __int128_t val) {
     asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
 }
 
-template<FwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>
+template<FwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE, bool PAIRED_INDICES>
 __device__ void
-KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_devfunc(const ArgT &params, const TmaParams &tma_params) {
+KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE, PAIRED_INDICES>::sparse_attn_fwd_kernel_devfunc(const ArgT &params, const TmaParams &tma_params) {
 #ifdef KERUTILS_ENABLE_SM100A
     // Grid shape: [2*s_q, 1, 1] for prefilling, [2*s_q, num_sm_parts, 1] for decoding w/ splitKV, [2*s_q, batch, 1] for decoding w/o splitKV
     // Cluster shape: [2, 1, 1]
@@ -173,6 +173,10 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
             while (next_job.is_valid) {
                 int s_q_idx = next_job.x / 2;
                 int batch_idx = IS_PREFILL ? 0 : next_job.y;
+                if constexpr (PAIRED_INDICES && FWD_MODE == FwdMode::Decode) {
+                    batch_idx = s_q_idx;
+                    s_q_idx = 0;
+                }
                 int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + (IS_PREFILL?s_q_idx:batch_idx)) : params.topk;
                 
                 if constexpr (IS_PREFILL) {
@@ -449,6 +453,11 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                                 "256B"
                             );
                         }
+                        if constexpr (PAIRED_INDICES) {
+                            CUTE_UNROLL
+                            for (int entry = 0; entry < NUM_ROWS_PER_THREAD; ++entry)
+                                cur_indices[entry] = cur_indices[entry] == -1 ? -1 : (uint32_t)cur_indices[entry] >> 2;
+                        }
                         smem.bar_KV_empty[k_buf_idx].wait(k_bar_phase^1);
 
                         CUTE_UNROLL
@@ -599,13 +608,22 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q;
                         CUTE_NO_UNROLL
                         for (int k = args.start_block_idx; k < args.end_block_idx; ++k) {
-                            char k_validness_mask = load_indices_and_generate_mask(
-                                lane_idx,
-                                gIndices + k*B_TOPK,
-                                params.s_kv,
-                                k*B_TOPK,
-                                args.topk_length
-                            );
+                            char k_validness_mask = 0;
+                            if constexpr (PAIRED_INDICES) {
+                                CUTE_UNROLL
+                                for (int entry = 0; entry < 8; ++entry) {
+                                    int position = k*B_TOPK + lane_idx*8 + entry;
+                                    uint32_t packed = __ldg(gIndices + position);
+                                    bool valid = packed != UINT32_MAX && (packed & (1u << cta_idx)) &&
+                                                 (packed >> 2) < params.s_kv && position < args.topk_length;
+                                    k_validness_mask |= valid << entry;
+                                }
+                            } else {
+                                k_validness_mask = load_indices_and_generate_mask(
+                                    lane_idx, gIndices + k*B_TOPK, params.s_kv,
+                                    k*B_TOPK, args.topk_length
+                                );
+                            }
                             
                             auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDEX_BUFS>();
                             smem.bar_valid_coord_empty[indices_buf_idx].wait(indices_bar_phase^1);
@@ -644,6 +662,12 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         int cur_tma_coords_step_per_block = IS_EXTRA_BLOCK ? tma_coords_step_per_extra_block : tma_coords_step_per_block;
 
                         int abs_pos = IS_EXTRA_BLOCK ? (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2 : block_idx*B_TOPK + lane_idx*2;
+                        int2 memberships = {3, 3};
+                        if constexpr (PAIRED_INDICES) {
+                            memberships = {my_indices.x & 3, my_indices.y & 3};
+                            my_indices.x = my_indices.x == -1 ? -1 : (uint32_t)my_indices.x >> 2;
+                            my_indices.y = my_indices.y == -1 ? -1 : (uint32_t)my_indices.y >> 2;
+                        }
 
                         smem.bar_valid_coord_empty[index_buf_idx].wait(index_bar_phase^1);
 
@@ -653,7 +677,12 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         for (int i = 0; i < 2; ++i) {
                             int cur_idx = i == 0 ? my_indices.x : my_indices.y;
                             bool is_token_valid = cur_idx != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
-                            valid_mask |= is_token_valid << i;
+                            if constexpr (PAIRED_INDICES) {
+                                int membership = i == 0 ? memberships.x : memberships.y;
+                                valid_mask |= (is_token_valid && (membership & (1 << cta_idx))) << i;
+                            } else {
+                                valid_mask |= is_token_valid << i;
+                            }
                             tma_coords[i] = is_token_valid ? ((unsigned int)cur_idx / cur_block_size)*cur_tma_coords_step_per_block + (unsigned int)cur_idx % cur_block_size : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
                         }
                         valid_mask <<= lane_idx%4*2;
@@ -911,8 +940,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const typename Kernel:
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
 }
 
-template<FwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>
-void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::run(const ArgT& params) {
+template<FwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE, bool PAIRED_INDICES>
+void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE, PAIRED_INDICES>::run(const ArgT& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.h_q == H_Q);  // To save some calculation
@@ -1048,7 +1077,9 @@ void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::run(const ArgT& par
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     dim3 grid_shape;
-    if constexpr (IS_DECODE) {
+    if constexpr (PAIRED_INDICES && FWD_MODE == FwdMode::Decode) {
+        grid_shape = dim3(2*params.b, 1, 1);
+    } else if constexpr (IS_DECODE) {
         grid_shape = dim3(2*params.s_q, FWD_MODE == FwdMode::DecodeWithSplitKV ? params.num_sm_parts : params.b, 1);
     } else {
         grid_shape = dim3(2*params.s_q, 1, 1);
@@ -1068,8 +1099,10 @@ void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::run(const ArgT& par
 
 template<FwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>
 void run_sparse_fwd_for_small_topk_phase1_kernel(const SparseFwdArgT<FWD_MODE>& params) {
-    using Kernel = KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>;
-    Kernel::run(params);
+    if (params.paired_indices)
+        KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE, true>::run(params);
+    else
+        KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE, false>::run(params);
 }
 
 }

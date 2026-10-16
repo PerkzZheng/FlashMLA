@@ -182,7 +182,9 @@ sparse_decode_fwd(
     const std::optional<Tensor> &extra_topk_length,
     int64_t d_v,
     double sm_scale,
-    bool enable_batch_invariant
+    bool enable_batch_invariant,
+    bool paired_indices,
+    bool auto_pair_schedule
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     // Check the architecture
@@ -218,9 +220,21 @@ sparse_decode_fwd(
 
     // Split-KV only pays off when a request has enough work
 #ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+    STD_TORCH_CHECK(!paired_indices, "Paired sparse decode requires CUDA Blackwell");
     bool enable_split_kv = false;   // Ascend does not support split-KV
 #else
-    bool enable_split_kv = !enable_batch_invariant && !(topk + extra_topk <= 640);
+    constexpr int no_split_topk_limit = 640;
+    bool enable_split_kv = !enable_batch_invariant && !(topk + extra_topk <= no_split_topk_limit);
+    if (paired_indices) {
+        STD_TORCH_CHECK(h_q == 128 && d_qk == 512 && s_q == 1,
+                        "Paired sparse decode requires 128 packed heads, D512 and flattened query pairs");
+        STD_TORCH_CHECK(!have_extra_kcache, "Paired sparse decode does not support extra KV");
+        STD_TORCH_CHECK(have_topk_length, "Paired sparse decode requires union lengths");
+        STD_TORCH_CHECK(!tile_scheduler_metadata.has_value() && !num_splits.has_value(),
+                        "Paired sparse decode must rebuild scheduling from current union lengths");
+        if (auto_pair_schedule && (topk <= 2 * no_split_topk_limit || (int64_t)b * 2 >= arch.num_sms))
+            enable_split_kv = false;
+    }
 #endif
 
     // metadata sanity check
@@ -375,6 +389,7 @@ sparse_decode_fwd(
         enable_split_kv,
     };
 
+    params.paired_indices = paired_indices;
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Tensor o_accum, lse_accum;
     if (enable_split_kv) {
@@ -398,7 +413,10 @@ sparse_decode_fwd(
                 num_splits->mutable_data_ptr<int>(),
                 get_current_stream()
             };
-            smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
+            if (paired_indices && auto_pair_schedule)
+                smxx::decode::run_get_pair_decoding_sched_meta_kernel(get_sched_meta_params);
+            else
+                smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
         }
         KU_CHECK_DEVICE(tile_scheduler_metadata);
         KU_CHECK_DEVICE(num_splits);

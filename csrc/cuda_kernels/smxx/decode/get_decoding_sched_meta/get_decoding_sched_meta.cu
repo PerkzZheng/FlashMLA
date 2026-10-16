@@ -20,6 +20,7 @@ I/O: See GetDecodeSchedMetaParams in csrc/params.h
 #include "get_decoding_sched_meta.h"
 
 #include <kerutils/kerutils.cuh>
+#include <cub/block/block_scan.cuh>
 
 namespace smxx::decode {
 
@@ -144,5 +145,83 @@ void run_get_decoding_sched_meta_kernel(const GetDecodeSchedMetaParams& params) 
     kernel<<<1, 32, smem_size, params.stream>>>(params);
     KU_CHECK_KERNEL_LAUNCH();
 }
+
+
+__global__ void __launch_bounds__(256)
+get_pair_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
+    using Scan = cub::BlockScan<int, 256>;
+    __shared__ typename Scan::TempStorage temporary;
+    __shared__ int block_offsets[257];
+    __shared__ int first_parts[256];
+    __shared__ int split_counts[256];
+    int group = threadIdx.x;
+    int blocks = 0;
+    if (group < params.b) {
+        int length = params.topk_length ? params.topk_length[group] : params.topk;
+        blocks = (max(length, 1) + params.block_size_topk - 1) / params.block_size_topk;
+    }
+    int block_begin, total_blocks;
+    Scan(temporary).ExclusiveSum(blocks, block_begin, total_blocks);
+    if (group < params.b) block_offsets[group] = block_begin;
+    if (group == 0) block_offsets[params.b] = total_blocks;
+    __syncthreads();
+
+    int minimum_blocks = max(params.fixed_overhead_num_blocks, 1);
+    int useful_parts = max(params.b, (total_blocks + minimum_blocks - 1) / minimum_blocks);
+    int active_parts = min(useful_parts, params.num_sm_parts);
+    int count = 0;
+    if (group < params.b) {
+        int first_part = ((int64_t)(block_begin + 1) * active_parts - 1) / total_blocks;
+        int last_part = ((int64_t)(block_begin + blocks) * active_parts - 1) / total_blocks;
+        count = last_part - first_part + 1;
+        first_parts[group] = first_part;
+        split_counts[group] = count;
+    }
+    int split_begin, total_splits;
+    Scan(temporary).ExclusiveSum(count, split_begin, total_splits);
+    if (group < params.b) params.num_splits_ptr[group] = split_begin;
+    if (group == 0) params.num_splits_ptr[params.b] = total_splits;
+    __syncthreads();
+
+    int part = threadIdx.x;
+    if (part >= params.num_sm_parts) return;
+    DecodingSchedMeta metadata{};
+    if (part >= active_parts) {
+        metadata.begin_req_idx = params.b;
+        metadata.end_req_idx = params.b - 1;
+    } else {
+        int begin = (int64_t)total_blocks * part / active_parts;
+        int end = (int64_t)total_blocks * (part + 1) / active_parts;
+        auto locate_group = [&](int block) {
+            int lower = 0, upper = params.b;
+            while (lower + 1 < upper) {
+                int middle = (lower + upper) / 2;
+                if (block_offsets[middle] <= block) lower = middle;
+                else upper = middle;
+            }
+            return lower;
+        };
+        int first_group = locate_group(begin);
+        int last_group = locate_group(end - 1);
+        metadata.begin_req_idx = first_group;
+        metadata.end_req_idx = last_group;
+        metadata.begin_block_idx = begin - block_offsets[first_group];
+        metadata.end_block_idx = end - block_offsets[last_group];
+        metadata.begin_split_idx = part - first_parts[first_group];
+        metadata.is_first_req_splitted = split_counts[first_group] > 1;
+        metadata.is_last_req_splitted = split_counts[last_group] > 1;
+    }
+    params.tile_scheduler_metadata_ptr[part] = metadata;
+}
+
+void run_get_pair_decoding_sched_meta_kernel(const GetDecodeSchedMetaParams& params) {
+    if (params.b > 256 || params.num_sm_parts > 256) {
+        run_get_decoding_sched_meta_kernel(params);
+        return;
+    }
+    get_pair_mla_metadata_kernel<<<1, 256, 0, params.stream>>>(params);
+    KU_CUDA_CHECK(cudaGetLastError());
+}
+
 
 }

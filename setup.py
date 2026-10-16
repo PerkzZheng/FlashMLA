@@ -191,6 +191,8 @@ def build_on_cuda_platform():
             name=EXT_NAME_CUDA,
             sources=[
                 *API_SOURCES,
+                "csrc/api/sparse_pair.cpp",
+                "csrc/cuda_kernels/smxx/sparse_pair_union.cu",
                 *CUDA_KERNEL_SOURCES,
             ],
             extra_compile_args={

@@ -41,6 +41,12 @@ from flash_mla.flash_mla_interface import (
 )
 
 from . import fused_norm_rope_attn_rope_cast
+from .sparse_pairs import (
+    SparsePairMetadata,
+    prepare_sparse_pairs,
+    flash_mla_with_kvcache_paired,
+    flash_mla_sparse_fwd_paired,
+)
 
 __all__ = [
     "get_mla_metadata",
@@ -49,5 +55,9 @@ __all__ = [
     "flash_attn_varlen_qkvpacked_func",
     "flash_attn_varlen_kvpacked_func",
     "flash_mla_sparse_fwd",
-    "fused_norm_rope_attn_rope_cast"
+    "fused_norm_rope_attn_rope_cast",
+    "SparsePairMetadata",
+    "prepare_sparse_pairs",
+    "flash_mla_with_kvcache_paired",
+    "flash_mla_sparse_fwd_paired",
 ]
