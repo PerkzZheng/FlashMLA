@@ -97,7 +97,8 @@ static std::vector<Tensor> sparse_prefill_fwd(
     double sm_scale,
     int64_t d_v,
     const std::optional<Tensor> &attn_sink,
-    const std::optional<Tensor> &topk_length
+    const std::optional<Tensor> &topk_length,
+    bool paired_indices
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
@@ -116,6 +117,13 @@ static std::vector<Tensor> sparse_prefill_fwd(
     int d_qk = q.size(2);
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
+    if (paired_indices) {
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+        STD_TORCH_CHECK(false, "Paired sparse prefill requires CUDA Blackwell");
+#endif
+        STD_TORCH_CHECK(h_q == 128 && h_kv == 1 && d_qk == 512 && have_topk_length,
+                        "Paired sparse prefill requires 128 packed heads, one KV head, D512 and union lengths");
+    }
 
     STD_TORCH_CHECK(d_qk == 512, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
@@ -176,6 +184,7 @@ static std::vector<Tensor> sparse_prefill_fwd(
         get_current_stream()
     };
 
+    params.paired_indices = paired_indices;
     std::vector<SparseFwdFeatures> required_features;
     if (h_q == 64) {
         required_features.push_back(SparseFwdFeatures::HEAD_64);
@@ -200,7 +209,7 @@ static std::vector<Tensor> sparse_prefill_fwd(
         SparseFwd_Sm100_Head128_Impl regular_impl;
         bool use_small_topk_impl = false;
         if (
-            (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
+            ((paired_indices || topk <= 1280) && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
             !regular_impl.check_if_all_features_are_supported(required_features)
         ) {
             use_small_topk_impl = true;

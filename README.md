@@ -10,6 +10,13 @@ FlashMLA 是 DeepSeek 的高性能注意力算子库，支撑着 [DeepSeek-V4.1]
 
 ## News
 
+An experimental [paired-query CUDA API](docs/paired-sparse-attention.md) groups
+two independently masked 64-head queries into the M128 two-CTA kernel. It
+supports current V4.1 FP8 decode and BF16 prefill on Blackwell; existing calls
+retain their routing. See the [benchmark quickstart](benchmark/README.md) and
+[full campaign instructions](benchmark/staging/README.md) for reproducible
+cold-L2 CUDA-graph comparisons, including union-metadata overhead.
+
 - **2026.09.30 Release of Ascend Attention Kernels**: We've released sparse attention prefill and decoding kernels for the Huawei Ascend 950 NPU, which achieve up to 410 TFlops (95% hardware peak) and 360 TFlops (83% of hardware peak) during prefill and decoding, respectively. We've also released [a deep-dive technical report](docs/20260930-ascend-prefill-deep-dive.md) on the algorithms and optimization techniques behind these kernels.
 
   我们发布了华为昇腾 NPU 平台上的稀疏注意力 Prefill 和 Decoding 算子，其在 Prefill 时能够达到 410 TFlops（95% 硬件极限），在 Decoding 时能达到 360 TFlops（83% 硬件极限）。此外，我们还发布了 [一篇简短的技术报告](docs/20260930-ascend-prefill-deep-dive-zh.md)，介绍了这个算子背后所使用到的算法与优化技术。

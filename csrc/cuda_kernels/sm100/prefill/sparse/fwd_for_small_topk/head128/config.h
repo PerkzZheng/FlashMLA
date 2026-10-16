@@ -16,7 +16,7 @@ namespace sm100::prefill::sparse_fwd_for_small_topk::head128 {
 
 using namespace cute;
 
-template<SparseAttnFwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>
+template<SparseAttnFwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE, bool PAIRED_INDICES>
 struct KernelTemplate {
 
 using ArgT = SparseFwdArgT<FWD_MODE>;
