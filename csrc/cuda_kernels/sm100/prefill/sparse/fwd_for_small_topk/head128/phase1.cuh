@@ -677,8 +677,12 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE, PAIRED_INDICES>::sparse_a
                         for (int i = 0; i < 2; ++i) {
                             int cur_idx = i == 0 ? my_indices.x : my_indices.y;
                             bool is_token_valid = cur_idx != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
-                            int membership = i == 0 ? memberships.x : memberships.y;
-                            valid_mask |= (is_token_valid && (membership & (1 << cta_idx))) << i;
+                            if constexpr (PAIRED_INDICES) {
+                                int membership = i == 0 ? memberships.x : memberships.y;
+                                valid_mask |= (is_token_valid && (membership & (1 << cta_idx))) << i;
+                            } else {
+                                valid_mask |= is_token_valid << i;
+                            }
                             tma_coords[i] = is_token_valid ? ((unsigned int)cur_idx / cur_block_size)*cur_tma_coords_step_per_block + (unsigned int)cur_idx % cur_block_size : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
                         }
                         valid_mask <<= lane_idx%4*2;
